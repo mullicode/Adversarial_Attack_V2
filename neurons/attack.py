@@ -2102,7 +2102,7 @@ def expand_beam_node(
     if not race.competitors:
         return None
 
-    max_attempts = min(len(race.competitors) * int(top_regions), 12)
+    max_attempts = min(len(race.competitors) * int(top_regions), 4)
     for offset in range(max_attempts):
         if deadline is not None and time.monotonic() >= deadline:
             return None
@@ -2160,7 +2160,7 @@ def expand_beam_node(
             min_delta=min_delta,
             max_delta=max_delta,
             round_id=round_id,
-            deadline=deadline,
+            deadline=None,
             max_pixels=REGION_GROW_INITIAL_BATCH,
         )
         if grow_result.pixels_applied <= 0 and not grow_result.seed_accepted:
@@ -2212,6 +2212,8 @@ def run_beam_search_phase(
 
         children: list[BeamNode] = []
         for node in beam:
+            if time.monotonic() >= budget.search_end:
+                break
             child = expand_beam_node(
                 model=model,
                 node=node,

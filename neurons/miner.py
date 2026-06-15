@@ -6,10 +6,10 @@ import typing
 
 import bittensor as bt
 import torch
-import torch.nn.functional as F
 
+from neurons.attack import feature_guided_sparse_untargeted_attack, inference_predict_index, inference_predict_label
 from perturbnet.image_io import decode_image_b64, encode_image_b64
-from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, resolve_target_index
+from perturbnet.model import load_efficientnet_v2_l, resolve_target_index
 from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
@@ -167,37 +167,24 @@ class PerturbMiner:
 
         epsilon = float(synapse.epsilon)
         min_delta = float(getattr(synapse, "min_delta", 0.002))
+        timeout_seconds = float(getattr(synapse, "timeout_seconds", 60))
 
-        # Basic default algorithm: small-step untargeted PGD.
-        steps = 10
-        step_size = max(epsilon / 4.0, 1.0 / 255.0)
-        adv = clean.clone().detach()
-        best = adv.clone()
-        best_delta = 0.0
-        final_pred = target_index
-        for _ in range(steps):
-            adv.requires_grad_(True)
-            logits = logits_for_images(model=self.model, image_bchw=adv.unsqueeze(0))
-            loss = F.cross_entropy(logits, torch.tensor([target_index], device=self.device))
-            grad = torch.autograd.grad(loss, adv)[0]
-            adv = adv.detach() + step_size * grad.sign()
-            adv = torch.max(torch.min(adv, clean + epsilon), clean - epsilon).clamp(0.0, 1.0)
-
-            pred = predict_index(model=self.model, image_chw=adv)
-            final_pred = pred
-            delta = float((adv - clean).abs().max().item())
-            if delta > best_delta:
-                best = adv.clone()
-                best_delta = delta
-            if pred != target_index and delta >= min_delta:
-                best = adv.clone()
-                break
-
-        adv = best
+        adv = feature_guided_sparse_untargeted_attack(
+            model=self.model,
+            clean=clean,
+            true_idx=target_index,
+            epsilon=epsilon,
+            min_delta=min_delta,
+            timeout_seconds=timeout_seconds,
+        )
+        final_pred = inference_predict_index(model=self.model, image_chw=adv)
+        final_label = inference_predict_label(model=self.model, image_chw=adv)
+        best_delta = float((adv - clean).abs().max().item())
         synapse.perturbed_image_b64 = encode_image_b64(adv)
         logger.info(
             f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={target_index} "
-            f"final_pred={final_pred} best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
+            f"final_pred={final_pred} final_label={final_label} "
+            f"best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
         )
         return synapse
 
