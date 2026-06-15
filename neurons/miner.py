@@ -204,6 +204,32 @@ class PerturbMiner:
             log_session=attack_output.log_session,
         )
 
+        excel_path = None
+        if attack_output.log_session is not None:
+            logging_dir = getattr(
+                getattr(self.config, "logging", None),
+                "logging_dir",
+                getattr(self.config, "logging_dir", "./logs"),
+            )
+            excel_dir = os.getenv(
+                "ATTACK_LOG_EXCEL_DIR",
+                os.path.join(str(logging_dir), "attack_excel"),
+            )
+            excel_path = attack_output.log_session.export_excel(
+                excel_dir,
+                extra_meta={
+                    "attack_k": attack_hyperparams.top_k,
+                    "beam_width": attack_hyperparams.beam_width,
+                    "top_regions": attack_hyperparams.top_regions_per_competitor,
+                    "region_grow_initial_batch": attack_hyperparams.region_grow_initial_batch,
+                    "region_grow_max_batch": attack_hyperparams.region_grow_max_batch,
+                    "attack_preset": os.getenv("PERTURB_ATTACK_PRESET", "strong"),
+                    "timeout_seconds": timeout_seconds,
+                    "roundtrip_ok": roundtrip.passed,
+                    "roundtrip_reason": roundtrip.reason,
+                },
+            )
+
         encoded = encode_image_b64(final_adv)
         decoded = decode_image_b64(encoded).to(self.device)
         decoded_pred = predict_index(model=self.model, image_chw=decoded)
@@ -221,7 +247,8 @@ class PerturbMiner:
             f"roundtrip_pred={decoded_pred} roundtrip_ok={roundtrip.passed} "
             f"roundtrip_restored={roundtrip.restored_from_backup} reason={roundtrip.reason} "
             f"min_delta={min_delta:.6f} effective_max={effective_max:.6f} "
-            f"(see [START]/[ATTACK]/[FLIP]/[PRUNE]/[ROUNDTRIP]/[FINAL] logs for full metrics)"
+            f"excel={excel_path} "
+            f"(see [START]/[ATTACK]/[FLIP]/[PRUNE]/[ROUNDTRIP]/[FINAL]/[EXCEL] logs for full metrics)"
         )
         return synapse
 
