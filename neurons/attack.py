@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -11,6 +12,8 @@ import torch.nn.functional as F
 from perturbnet.constants import MAX_LINF_DELTA, MIN_LINF_DELTA, MIN_PSNR_DB, MIN_SSIM, TIMEOUT_SECONDS
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import forward_logits_features, logits_for_images, predict_index, predict_label
+
+from neurons.attack_log import AttackLogSession, build_validator_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -28,16 +31,18 @@ FEATURE_CELL_EXPAND_REFINE = 1.5
 # Validator-visible pixel step in decoded [0, 1] image space.
 PIXEL_STEP_RAW = 1.0 / 255.0
 
-# Untargeted top-K competitor race (K=10 default for subnet timeout/model size).
-DEFAULT_TOP_K = 10
+# Untargeted top-K competitor race.
 TOP_K_FAST = 5
+TOP_K_STARTING = 8
 TOP_K_BALANCED = 10
 TOP_K_STRONG = 20
+DEFAULT_TOP_K = TOP_K_STRONG
 
-# Region ranking defaults (validator timeout aware).
-DEFAULT_TOP_REGIONS_PER_COMPETITOR = 6
-TOP_REGIONS_FAST = 5
-TOP_REGIONS_QUALITY = 15
+# Region ranking.
+TOP_REGIONS_FAST = 4
+TOP_REGIONS_STARTING = 6
+TOP_REGIONS_QUALITY = 12
+DEFAULT_TOP_REGIONS_PER_COMPETITOR = TOP_REGIONS_QUALITY
 REGION_PIXEL_GRAD_TOP_N = 32
 
 # Discrete ±1/255 pixel selection inside ranked regions.
@@ -45,29 +50,141 @@ DEFAULT_TOP_PIXELS_PER_REGION = 8
 DEFAULT_MAX_PIXELS_PER_STEP = 24
 DEFAULT_MIN_GAIN_PER_PIXEL = 1e-6
 
-# Region growing after a verified seed batch (step 13).
+# Region growing after a verified seed batch (step 13): batch 8 -> 64.
 REGION_GROW_INITIAL_BATCH = 8
 REGION_GROW_MAX_BATCH = 64
 REGION_GROW_MIN_BATCH = 4
-REGION_GROW_MAX_PIXELS_PER_REGION = 128
+REGION_GROW_MAX_PIXELS_PER_REGION = 64
 REGION_GROW_STRONG_GAIN_PER_PIXEL = 1e-4
 REGION_GROW_CLOSE_TO_FLIP_GAP = 0.5
 REGION_GROW_CLOSE_TO_FLIP_RATIO = 0.15
 REGION_GROW_MAX_FAILURES = 2
 
-# Beam search adapted to validator timeout (step 14).
-DEFAULT_BEAM_WIDTH = 4
-BEAM_WIDTH_FAST = 3
-DEFAULT_BEAM_TOP_K = 10
-DEFAULT_BEAM_TOP_REGIONS = 6
+# Beam search (step 14): strong offline default K=20, beam=8, regions=12.
+BEAM_WIDTH_FAST = 2
+BEAM_WIDTH_STARTING = 4
+BEAM_WIDTH_STRONG = 8
+DEFAULT_BEAM_WIDTH = BEAM_WIDTH_STRONG
+DEFAULT_BEAM_TOP_K = TOP_K_STRONG
+DEFAULT_BEAM_TOP_REGIONS = TOP_REGIONS_QUALITY
 ATTACK_TIME_SEARCH_FRACTION = 0.60
 ATTACK_TIME_PRUNE_FRACTION = 0.25
 ATTACK_TIME_VALIDATE_FRACTION = 0.10
 ATTACK_TIME_BUFFER_FRACTION = 0.05
 ATTACK_SEARCH_ROUND_FRACTION = 0.75
 
+# Safety flip margin before aggressive final pruning (step 16).
+DEFAULT_FLIP_MARGIN_BEFORE_PRUNE = 0.03
+
 # Validator-score aware pruning chunk sizes (step 15).
 PRUNE_CHUNK_SIZES = (16, 8, 4, 1)
+
+
+@dataclass(frozen=True)
+class AttackHyperparams:
+    """Tunable attack-engine profile for subnet timeout vs offline testing."""
+
+    top_k: int
+    beam_width: int
+    top_regions_per_competitor: int
+    feature_box_expand: float = FEATURE_CELL_EXPAND_FIRST
+    region_grow_initial_batch: int = REGION_GROW_INITIAL_BATCH
+    region_grow_max_batch: int = REGION_GROW_MAX_BATCH
+    region_grow_min_batch: int = REGION_GROW_MIN_BATCH
+    region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION
+    search_time_fraction: float = ATTACK_TIME_SEARCH_FRACTION
+    prune_time_fraction: float = ATTACK_TIME_PRUNE_FRACTION
+    validate_time_fraction: float = ATTACK_TIME_VALIDATE_FRACTION
+    buffer_time_fraction: float = ATTACK_TIME_BUFFER_FRACTION
+    flip_margin_before_prune: float = DEFAULT_FLIP_MARGIN_BEFORE_PRUNE
+    shrink_beam_on_short_timeout: bool = False
+
+
+ATTACK_PRESET_FAST = AttackHyperparams(
+    top_k=TOP_K_FAST,
+    beam_width=BEAM_WIDTH_FAST,
+    top_regions_per_competitor=TOP_REGIONS_FAST,
+    shrink_beam_on_short_timeout=True,
+)
+
+ATTACK_PRESET_DEFAULT = AttackHyperparams(
+    top_k=TOP_K_STARTING,
+    beam_width=BEAM_WIDTH_STARTING,
+    top_regions_per_competitor=TOP_REGIONS_STARTING,
+    shrink_beam_on_short_timeout=True,
+)
+
+ATTACK_PRESET_STRONG = AttackHyperparams(
+    top_k=TOP_K_STRONG,
+    beam_width=BEAM_WIDTH_STRONG,
+    top_regions_per_competitor=TOP_REGIONS_QUALITY,
+    region_grow_initial_batch=8,
+    region_grow_max_batch=64,
+    region_grow_max_pixels_per_region=64,
+    shrink_beam_on_short_timeout=False,
+)
+
+DEFAULT_ATTACK_HYPERPARAMS = ATTACK_PRESET_STRONG
+
+
+def resolve_attack_hyperparams(preset: str | None = None) -> AttackHyperparams:
+    """
+    Resolve attack profile from explicit name or PERTURB_ATTACK_PRESET env var.
+
+    Presets: fast | default | strong (offline)
+    """
+    name = (preset or os.getenv("PERTURB_ATTACK_PRESET") or "strong").strip().lower()
+    if name in {"fast", "quick", "subnet"}:
+        return ATTACK_PRESET_FAST
+    if name in {"default", "balanced", "starting", "start"}:
+        return ATTACK_PRESET_DEFAULT
+    if name in {"strong", "offline", "quality"}:
+        return ATTACK_PRESET_STRONG
+    logger.warning("Unknown attack preset %r; using strong offline defaults", name)
+    return DEFAULT_ATTACK_HYPERPARAMS
+
+
+@dataclass(frozen=True)
+class CandidateStats:
+    norm: float
+    rmse: float
+
+
+@dataclass(frozen=True)
+class FlipGapStats:
+    logits: torch.Tensor
+    true_idx: int
+    pred_idx: int
+    best_other_idx: int
+    untargeted_gap: float
+    norm: float
+    rmse: float
+
+    @property
+    def flipped(self) -> bool:
+        return self.pred_idx != self.true_idx
+
+@dataclass(frozen=True)
+class PngRoundtripResult:
+    final_adv: torch.Tensor
+    encoded_b64: str
+    decoded_adv: torch.Tensor
+    pred_idx: int
+    norm: float
+    rmse: float
+    passed: bool
+    restored_from_backup: bool
+    reason: str
+
+
+@dataclass
+class FeatureGuidedAttackOutput:
+    adv: torch.Tensor
+    pre_prune_adv: torch.Tensor
+    accepted_groups: list[AcceptedGroup]
+    fallback_state: AttackState
+    flip_stats: FlipGapStats | None = None
+    log_session: AttackLogSession | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +337,7 @@ class RegionGrowSession:
     region: RankedRegion
     batch_size: int = REGION_GROW_INITIAL_BATCH
     failure_count: int = 0
+    weak_count: int = 0
     pixels_applied: int = 0
     seed_accepted: bool = False
     stopped: bool = False
@@ -1039,6 +1157,9 @@ def try_region_growth_batch(
     min_delta: float,
     seed_phase: bool,
     round_id: int,
+    log_session: AttackLogSession | None = None,
+    beam_id: int | None = None,
+    batch_size: int | None = None,
 ) -> tuple[bool, TrialVerification | None, AcceptedGroup | None, str]:
     delta_try = build_delta_try_from_changes(state=state, pixel_changes=pixel_changes)
     if delta_try is None:
@@ -1063,6 +1184,18 @@ def try_region_growth_batch(
         epsilon=epsilon,
     )
     if not accept:
+        if log_session is not None:
+            log_session.log_attack_batch(
+                verification=verification,
+                region=region,
+                competitor_idx=competitor_idx,
+                batch_size=int(batch_size or len(pixel_changes)),
+                accepted=False,
+                reason=reason,
+                beam_id=beam_id,
+                round_id=round_id,
+                gap_before=gap_before,
+            )
         return False, verification, None, reason
 
     commit_verified_delta(state=state, delta_try=delta_try, logits=verification.logits)
@@ -1078,6 +1211,18 @@ def try_region_growth_batch(
         round_id=round_id,
     )
     state.accepted_groups.append(accepted_group)
+    if log_session is not None:
+        log_session.log_attack_batch(
+            verification=verification,
+            region=region,
+            competitor_idx=competitor_idx,
+            batch_size=int(batch_size or len(pixel_changes)),
+            accepted=True,
+            reason=reason,
+            beam_id=beam_id,
+            round_id=round_id,
+            gap_before=gap_before,
+        )
     return True, verification, accepted_group, reason
 
 
@@ -1095,6 +1240,8 @@ def grow_ranked_region(
     round_id: int = 0,
     deadline: float | None = None,
     max_pixels: int | None = None,
+    log_session: AttackLogSession | None = None,
+    beam_id: int | None = None,
 ) -> RegionGrowResult:
     """
     Seed then adaptively grow one ranked region in verified pixel batches.
@@ -1146,6 +1293,9 @@ def grow_ranked_region(
             min_delta=min_delta,
             seed_phase=seed_phase,
             round_id=round_id,
+            log_session=log_session,
+            beam_id=beam_id,
+            batch_size=batch_size,
         )
 
         if verification is not None:
@@ -1156,6 +1306,8 @@ def grow_ranked_region(
 
         if not accepted:
             session.failure_count += 1
+            if reason in {"weak_gain_not_close_to_flip", "weak_gain_per_pixel"}:
+                session.weak_count += 1
             session.batch_size = _decrease_grow_batch_size(session.batch_size)
             if not session.seed_accepted:
                 session.stopped = True
@@ -1191,6 +1343,17 @@ def grow_ranked_region(
 
     if session.stopped and stopped_reason == "not_started":
         stopped_reason = "max_pixels" if session.pixels_applied >= pixel_cap else "done"
+
+    if log_session is not None:
+        log_session.log_region_saturation(
+            region=region,
+            competitor_idx=competitor_idx,
+            fail_count=session.failure_count,
+            weak_count=session.weak_count,
+            pixels_applied=session.pixels_applied,
+            stopped_reason=stopped_reason,
+            round_id=round_id,
+        )
 
     return RegionGrowResult(
         region=region,
@@ -2086,6 +2249,9 @@ def expand_beam_node(
     top_regions: int,
     round_id: int,
     deadline: float | None,
+    region_grow_initial_batch: int = REGION_GROW_INITIAL_BATCH,
+    log_session: AttackLogSession | None = None,
+    beam_id: int | None = None,
 ) -> BeamNode | None:
     """Expand one beam path by growing a single competitor region branch."""
     if deadline is not None and time.monotonic() >= deadline:
@@ -2160,7 +2326,9 @@ def expand_beam_node(
             max_delta=max_delta,
             round_id=round_id,
             deadline=None,
-            max_pixels=REGION_GROW_INITIAL_BATCH,
+            max_pixels=region_grow_initial_batch,
+            log_session=log_session,
+            beam_id=beam_id,
         )
         if grow_result.pixels_applied <= 0 and not grow_result.seed_accepted:
             continue
@@ -2196,6 +2364,9 @@ def run_beam_search_phase(
     top_k: int = DEFAULT_BEAM_TOP_K,
     top_regions: int = DEFAULT_BEAM_TOP_REGIONS,
     max_rounds: int = DEFAULT_STEPS,
+    region_grow_initial_batch: int = REGION_GROW_INITIAL_BATCH,
+    region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION,
+    log_session: AttackLogSession | None = None,
 ) -> tuple[list[BeamNode], BeamNode | None]:
     max_delta = _effective_max_delta(epsilon)
     min_delta = float(min_delta)
@@ -2209,8 +2380,23 @@ def run_beam_search_phase(
         if now >= budget.search_end or now >= budget.search_round_end:
             break
 
+        if log_session is not None:
+            with torch.no_grad():
+                race = compute_top_k_competitors(
+                    logits=initial_state.logits.unsqueeze(0),
+                    true_idx=true_idx,
+                    k=top_k,
+                )
+            if beam:
+                race = compute_top_k_competitors(
+                    logits=beam[0].state.logits.unsqueeze(0),
+                    true_idx=true_idx,
+                    k=top_k,
+                )
+            log_session.log_topk_competitors(race, round_id=round_idx)
+
         children: list[BeamNode] = []
-        for node in beam:
+        for beam_idx, node in enumerate(beam):
             if time.monotonic() >= budget.search_end:
                 break
             child = expand_beam_node(
@@ -2224,6 +2410,9 @@ def run_beam_search_phase(
                 top_regions=top_regions,
                 round_id=round_idx,
                 deadline=budget.search_end,
+                region_grow_initial_batch=region_grow_initial_batch,
+                log_session=log_session,
+                beam_id=beam_idx,
             )
             if child is not None:
                 children.append(child)
@@ -2283,7 +2472,7 @@ def run_beam_search_phase(
                         max_delta=max_delta,
                         round_id=round_idx,
                         deadline=None,
-                        max_pixels_per_region=REGION_GROW_INITIAL_BATCH,
+                        max_pixels_per_region=region_grow_initial_batch,
                     )
                     if applied > 0:
                         recent_gain = 0.0
@@ -2312,6 +2501,8 @@ def run_beam_search_phase(
             min_delta=min_delta,
             max_delta=max_delta,
         )
+        if log_session is not None:
+            log_session.log_beam_round(beam, round_id=round_idx)
         round_idx += 1
 
     return beam, best_flip
@@ -2328,6 +2519,7 @@ def deepen_beam_node(
     top_k: int,
     top_regions: int,
     deadline: float | None,
+    region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION,
 ) -> BeamNode:
     """Run full region growth on the best beam path during the prune phase."""
     state = clone_attack_state(node.state)
@@ -2380,7 +2572,7 @@ def deepen_beam_node(
         max_delta=max_delta,
         round_id=node.round_id,
         deadline=deadline,
-        max_pixels_per_region=REGION_GROW_MAX_PIXELS_PER_REGION,
+        max_pixels_per_region=region_grow_max_pixels_per_region,
     )
     recent_gain = node.recent_gain_per_pixel
     if state.accepted_groups:
@@ -2516,6 +2708,7 @@ def prune_validator_aware_state(
     max_delta: float,
     top_k: int = DEFAULT_TOP_K,
     deadline: float | None = None,
+    log_session: AttackLogSession | None = None,
 ) -> AttackState:
     """
     Validator-score aware pruning (step 15).
@@ -2538,6 +2731,16 @@ def prune_validator_aware_state(
         max_delta=max_delta,
     ):
         return state
+
+    before_snap = build_validator_snapshot(
+        logits=state.logits,
+        true_idx=true_idx,
+        clean=state.clean,
+        adv=adv,
+        changed_mask=state.changed_mask,
+    )
+    if log_session is not None:
+        log_session.log_prune_start(before_snap)
 
     remaining_groups = list(state.accepted_groups)
 
@@ -2697,10 +2900,18 @@ def prune_validator_aware_state(
                 top_k=top_k,
             )
 
+    after_snap = build_validator_snapshot(
+        logits=state.logits,
+        true_idx=true_idx,
+        clean=state.clean,
+        adv=state.adv,
+        changed_mask=state.changed_mask,
+    )
+    if log_session is not None:
+        log_session.log_prune_result(before_snap, after_snap)
+        log_session.log_accepted_groups(state.accepted_groups)
+
     return state
-
-
-def prune_beam_node_validator_aware(
     model: torch.nn.Module,
     node: BeamNode,
     *,
@@ -2738,6 +2949,9 @@ def prune_beam_candidates(
     min_delta: float,
     max_delta: float,
     budget: AttackTimeBudget,
+    top_regions: int = DEFAULT_BEAM_TOP_REGIONS,
+    region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION,
+    log_session: AttackLogSession | None = None,
 ) -> list[BeamNode]:
     """
     Re-score surviving paths, deepen, validator-aware prune, and drop dominated candidates.
@@ -2772,8 +2986,9 @@ def prune_beam_candidates(
                 min_delta=min_delta,
                 max_delta=max_delta,
                 top_k=top_k,
-                top_regions=DEFAULT_BEAM_TOP_REGIONS,
+                top_regions=top_regions,
                 deadline=budget.prune_end,
+                region_grow_max_pixels_per_region=region_grow_max_pixels_per_region,
             )
         )
     refreshed = deepened
@@ -2793,6 +3008,7 @@ def prune_beam_candidates(
                     max_delta=max_delta,
                     top_k=top_k,
                     deadline=budget.prune_end,
+                    log_session=log_session,
                 )
             )
         else:
@@ -2855,6 +3071,179 @@ def validator_passes_adv(
     return ssim >= float(MIN_SSIM) and psnr_db >= float(MIN_PSNR_DB)
 
 
+def candidate_stats(clean: torch.Tensor, adv: torch.Tensor) -> CandidateStats:
+    norm = float((adv - clean).abs().max().item())
+    rmse = _compute_path_rmse(clean, adv)
+    return CandidateStats(norm=norm, rmse=rmse)
+
+
+def check_flip_and_gap(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    adv: torch.Tensor,
+    true_idx: int,
+) -> FlipGapStats:
+    logits = _logits_row(inference_logits(model=model, image_chw=adv)).detach().to(dtype=torch.float32)
+    pred_idx = int(logits.argmax().item())
+    masked = logits.clone()
+    masked[true_idx] = float("-inf")
+    best_other_idx = int(masked.argmax().item())
+    stats = candidate_stats(clean, adv)
+    return FlipGapStats(
+        logits=logits,
+        true_idx=true_idx,
+        pred_idx=pred_idx,
+        best_other_idx=best_other_idx,
+        untargeted_gap=untargeted_gap(logits.unsqueeze(0), true_idx),
+        norm=stats.norm,
+        rmse=stats.rmse,
+    )
+
+
+def _has_flip_margin(stats: FlipGapStats, *, margin: float) -> bool:
+    if not stats.flipped:
+        return False
+    true_logit = float(stats.logits[stats.true_idx].item())
+    best_other_logit = float(stats.logits[stats.best_other_idx].item())
+    return best_other_logit >= true_logit + float(margin)
+
+
+def _adv_from_accepted_group(clean: torch.Tensor, group: AcceptedGroup) -> torch.Tensor:
+    delta, _ = delta_from_pixel_changes(clean, group.pixels)
+    return (clean + delta).clamp(0.0, 1.0)
+
+
+def _roundtrip_restore_candidates(
+    clean: torch.Tensor,
+    adv: torch.Tensor,
+    *,
+    accepted_groups: list[AcceptedGroup] | None,
+    restore_adv_candidates: list[torch.Tensor] | None,
+) -> list[torch.Tensor]:
+    candidates: list[torch.Tensor] = []
+    seen: set[tuple[int, ...]] = set()
+
+    def _add(tensor: torch.Tensor) -> None:
+        key = tuple(int(v) for v in (tensor.detach().cpu().clamp(0, 1) * 255.0).round().byte().reshape(-1)[:64].tolist())
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(tensor.detach().clamp(0.0, 1.0))
+
+    if restore_adv_candidates:
+        for item in restore_adv_candidates:
+            _add(item)
+
+    if accepted_groups:
+        for group in sorted(
+            accepted_groups,
+            key=lambda batch: (batch.gain_per_pixel, batch.gain),
+            reverse=True,
+        ):
+            _add(_adv_from_accepted_group(clean, group))
+
+    _add(adv)
+    return candidates
+
+
+def _roundtrip_decoded_passes(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    decoded: torch.Tensor,
+    true_idx: int,
+    *,
+    min_delta: float,
+    max_delta: float,
+) -> bool:
+    if decoded.shape != clean.shape:
+        return False
+    pred_idx = inference_predict_index(model=model, image_chw=decoded)
+    stats = candidate_stats(clean, decoded)
+    if pred_idx == true_idx:
+        return False
+    if stats.norm < float(min_delta) - 1e-9 or stats.norm > float(max_delta) + 1e-9:
+        return False
+    return validator_passes_adv(
+        model=model,
+        clean=clean,
+        adv=decoded,
+        true_idx=true_idx,
+        min_delta=min_delta,
+        max_delta=max_delta,
+    )
+
+
+def png_roundtrip_verify(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    adv: torch.Tensor,
+    true_idx: int,
+    *,
+    min_delta: float,
+    max_delta: float,
+    accepted_groups: list[AcceptedGroup] | None = None,
+    restore_adv_candidates: list[torch.Tensor] | None = None,
+) -> PngRoundtripResult:
+    """
+    PNG encode/decode roundtrip using perturbnet.image_io helpers.
+
+    encoded = encode_image_b64(adv)
+    decoded = decode_image_b64(encoded)
+
+    Re-runs predict_index and norm/rmse on decoded pixels. If roundtrip loses flip,
+    tries restore candidates (pre-prune adv, highest-gain batches, then original adv).
+    """
+    trial_adv_list = _roundtrip_restore_candidates(
+        clean=clean,
+        adv=adv,
+        accepted_groups=accepted_groups,
+        restore_adv_candidates=restore_adv_candidates,
+    )
+
+    for index, trial_adv in enumerate(trial_adv_list):
+        encoded = encode_image_b64(trial_adv)
+        decoded = decode_image_b64(encoded).to(device=clean.device)
+        stats = candidate_stats(clean, decoded)
+        pred_idx = inference_predict_index(model=model, image_chw=decoded)
+
+        if _roundtrip_decoded_passes(
+            model=model,
+            clean=clean,
+            decoded=decoded,
+            true_idx=true_idx,
+            min_delta=min_delta,
+            max_delta=max_delta,
+        ):
+            return PngRoundtripResult(
+                final_adv=decoded.clamp(0.0, 1.0),
+                encoded_b64=encoded,
+                decoded_adv=decoded,
+                pred_idx=pred_idx,
+                norm=stats.norm,
+                rmse=stats.rmse,
+                passed=True,
+                restored_from_backup=index > 0,
+                reason="roundtrip_ok" if index == 0 else "restored_backup",
+            )
+
+    fallback = adv.detach().clamp(0.0, 1.0)
+    encoded = encode_image_b64(fallback)
+    decoded = decode_image_b64(encoded).to(device=clean.device)
+    stats = candidate_stats(clean, decoded)
+    pred_idx = inference_predict_index(model=model, image_chw=decoded)
+    return PngRoundtripResult(
+        final_adv=fallback,
+        encoded_b64=encoded,
+        decoded_adv=decoded,
+        pred_idx=pred_idx,
+        norm=stats.norm,
+        rmse=stats.rmse,
+        passed=False,
+        restored_from_backup=False,
+        reason="roundtrip_flip_lost",
+    )
+
+
 def final_validate_roundtrip(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -2863,38 +3252,21 @@ def final_validate_roundtrip(
     *,
     min_delta: float,
     max_delta: float,
+    accepted_groups: list[AcceptedGroup] | None = None,
+    restore_adv_candidates: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """PNG encode/decode roundtrip plus validator-style forward checks."""
-    candidate = adv.detach().clamp(0.0, 1.0)
-    try:
-        roundtrip = decode_image_b64(encode_image_b64(candidate)).to(device=clean.device)
-    except Exception:
-        roundtrip = candidate
-
-    if roundtrip.shape != clean.shape:
-        return candidate
-
-    if validator_passes_adv(
+    """Backward-compatible wrapper around png_roundtrip_verify."""
+    result = png_roundtrip_verify(
         model=model,
         clean=clean,
-        adv=roundtrip,
+        adv=adv,
         true_idx=true_idx,
         min_delta=min_delta,
         max_delta=max_delta,
-    ):
-        return roundtrip.clamp(0.0, 1.0)
-
-    if validator_passes_adv(
-        model=model,
-        clean=clean,
-        adv=candidate,
-        true_idx=true_idx,
-        min_delta=min_delta,
-        max_delta=max_delta,
-    ):
-        return candidate
-
-    return candidate
+        accepted_groups=accepted_groups,
+        restore_adv_candidates=restore_adv_candidates,
+    )
+    return result.final_adv
 
 
 def select_best_beam_node(
@@ -2915,6 +3287,27 @@ def select_best_beam_node(
     return min(
         beam,
         key=lambda node: beam_rank_key(node, min_delta=min_delta, max_delta=max_delta),
+    )
+
+
+def pgd_fallback_attack(
+    model: torch.nn.Module,
+    state: AttackState,
+    true_idx: int,
+    *,
+    max_delta: float,
+    min_delta: float,
+    deadline: float,
+    steps: int = 10,
+) -> torch.Tensor:
+    return _pgd_fallback_attack(
+        model=model,
+        state=state,
+        true_idx=true_idx,
+        max_delta=max_delta,
+        min_delta=min_delta,
+        deadline=deadline,
+        steps=steps,
     )
 
 
@@ -2955,7 +3348,7 @@ def _pgd_fallback_attack(
     return adv
 
 
-def feature_guided_sparse_untargeted_attack(
+def run_feature_guided_attack(
     model: torch.nn.Module,
     clean: torch.Tensor,
     true_idx: int,
@@ -2965,25 +3358,40 @@ def feature_guided_sparse_untargeted_attack(
     *,
     steps: int = DEFAULT_STEPS,
     sparse_fraction: float = SPARSE_PIXEL_FRACTION,
-    top_k: int = DEFAULT_BEAM_TOP_K,
-    beam_width: int = DEFAULT_BEAM_WIDTH,
-    top_regions: int = DEFAULT_BEAM_TOP_REGIONS,
-) -> torch.Tensor:
+    hyperparams: AttackHyperparams | None = None,
+    top_k: int | None = None,
+    beam_width: int | None = None,
+    top_regions: int | None = None,
+    flip_margin_before_prune: float | None = None,
+) -> FeatureGuidedAttackOutput:
     """
-    Untargeted attack in decoded raw image space [3, H, W] in [0, 1].
+    Full feature-guided attack with metadata for miner finalization (steps 4-7).
+    """
+    del sparse_fraction
 
-    Timeout-aware beam search with phased budgets:
-    60% search, 25% pruning, 10% PNG roundtrip validation, 5% buffer.
-    """
-    del sparse_fraction  # kept for miner API compatibility
+    hp = hyperparams or DEFAULT_ATTACK_HYPERPARAMS
+    resolved_top_k = int(top_k if top_k is not None else hp.top_k)
+    resolved_beam_width = int(beam_width if beam_width is not None else hp.beam_width)
+    resolved_top_regions = int(top_regions if top_regions is not None else hp.top_regions_per_competitor)
+    resolved_flip_margin = float(
+        flip_margin_before_prune
+        if flip_margin_before_prune is not None
+        else hp.flip_margin_before_prune
+    )
 
     max_delta = _effective_max_delta(epsilon)
     min_delta = float(min_delta)
-    budget = AttackTimeBudget.from_timeout(timeout_seconds)
+    budget = AttackTimeBudget.from_timeout(
+        timeout_seconds,
+        search_fraction=hp.search_time_fraction,
+        prune_fraction=hp.prune_time_fraction,
+        validate_fraction=hp.validate_time_fraction,
+        buffer_fraction=hp.buffer_time_fraction,
+    )
 
-    effective_beam_width = int(beam_width)
-    if float(timeout_seconds) <= float(TIMEOUT_SECONDS):
-        effective_beam_width = min(effective_beam_width, BEAM_WIDTH_FAST)
+    effective_beam_width = resolved_beam_width
+    if hp.shrink_beam_on_short_timeout and float(timeout_seconds) <= float(TIMEOUT_SECONDS):
+        effective_beam_width = min(resolved_beam_width, ATTACK_PRESET_FAST.beam_width)
 
     beam, best_flip = run_beam_search_phase(
         model=model,
@@ -2993,9 +3401,11 @@ def feature_guided_sparse_untargeted_attack(
         min_delta=min_delta,
         budget=budget,
         beam_width=effective_beam_width,
-        top_k=int(top_k),
-        top_regions=int(top_regions),
+        top_k=resolved_top_k,
+        top_regions=resolved_top_regions,
         max_rounds=int(steps),
+        region_grow_initial_batch=hp.region_grow_initial_batch,
+        region_grow_max_pixels_per_region=hp.region_grow_max_pixels_per_region,
     )
 
     if time.monotonic() < budget.prune_end:
@@ -3004,11 +3414,13 @@ def feature_guided_sparse_untargeted_attack(
             beam=beam,
             true_idx=true_idx,
             epsilon=epsilon,
-            top_k=int(top_k),
+            top_k=resolved_top_k,
             beam_width=effective_beam_width,
             min_delta=min_delta,
             max_delta=max_delta,
             budget=budget,
+            top_regions=resolved_top_regions,
+            region_grow_max_pixels_per_region=hp.region_grow_max_pixels_per_region,
         )
 
     best_node = select_best_beam_node(
@@ -3021,30 +3433,31 @@ def feature_guided_sparse_untargeted_attack(
     if best_node is None:
         fallback_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
         adv = fallback_state.adv
+        pre_prune_adv = adv.clone()
+        accepted_groups: list[AcceptedGroup] = []
     else:
-        if _is_valid_flip_node(best_node, min_delta=min_delta, max_delta=max_delta):
+        pre_prune_adv = best_node.adv.clone()
+        accepted_groups = list(best_node.state.accepted_groups)
+        flip_stats = check_flip_and_gap(model=model, clean=clean, adv=pre_prune_adv, true_idx=true_idx)
+        if _is_valid_flip_node(best_node, min_delta=min_delta, max_delta=max_delta) and _has_flip_margin(
+            flip_stats,
+            margin=resolved_flip_margin,
+        ):
             pruned_state = prune_validator_aware_state(
                 model=model,
                 state=clone_attack_state(best_node.state),
                 true_idx=true_idx,
                 min_delta=min_delta,
                 max_delta=max_delta,
-                top_k=int(top_k),
+                top_k=resolved_top_k,
                 deadline=budget.validate_end,
             )
             best_node = build_beam_node(pruned_state)
         adv = best_node.adv
         fallback_state = clone_attack_state(best_node.state)
+        accepted_groups = list(best_node.state.accepted_groups)
 
-    if time.monotonic() < budget.validate_end:
-        adv = final_validate_roundtrip(
-            model=model,
-            clean=clean,
-            adv=adv,
-            true_idx=true_idx,
-            min_delta=min_delta,
-            max_delta=max_delta,
-        )
+    flip_stats = check_flip_and_gap(model=model, clean=clean, adv=adv, true_idx=true_idx)
 
     if not validator_passes_adv(
         model=model,
@@ -3054,7 +3467,7 @@ def feature_guided_sparse_untargeted_attack(
         min_delta=min_delta,
         max_delta=max_delta,
     ):
-        adv = _pgd_fallback_attack(
+        adv = pgd_fallback_attack(
             model=model,
             state=fallback_state,
             true_idx=true_idx,
@@ -3063,5 +3476,134 @@ def feature_guided_sparse_untargeted_attack(
             deadline=budget.hard_end,
             steps=min(10, int(steps)),
         )
+        flip_stats = check_flip_and_gap(model=model, clean=clean, adv=adv, true_idx=true_idx)
 
-    return adv.clamp(0.0, 1.0)
+    return FeatureGuidedAttackOutput(
+        adv=adv.clamp(0.0, 1.0),
+        pre_prune_adv=pre_prune_adv.clamp(0.0, 1.0),
+        accepted_groups=accepted_groups,
+        fallback_state=fallback_state,
+        flip_stats=flip_stats,
+    )
+
+
+def feature_guided_sparse_untargeted_attack(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    true_idx: int,
+    epsilon: float,
+    min_delta: float,
+    timeout_seconds: float | int,
+    *,
+    steps: int = DEFAULT_STEPS,
+    sparse_fraction: float = SPARSE_PIXEL_FRACTION,
+    hyperparams: AttackHyperparams | None = None,
+    top_k: int | None = None,
+    beam_width: int | None = None,
+    top_regions: int | None = None,
+) -> torch.Tensor:
+    """
+    Untargeted attack in decoded raw image space [3, H, W] in [0, 1].
+
+    Timeout-aware beam search with phased budgets:
+    60% search, 25% pruning, 10% PNG roundtrip validation, 5% buffer.
+    """
+    output = run_feature_guided_attack(
+        model=model,
+        clean=clean,
+        true_idx=true_idx,
+        epsilon=epsilon,
+        min_delta=min_delta,
+        timeout_seconds=timeout_seconds,
+        steps=steps,
+        sparse_fraction=sparse_fraction,
+        hyperparams=hyperparams,
+        top_k=top_k,
+        beam_width=beam_width,
+        top_regions=top_regions,
+    )
+
+    max_delta = _effective_max_delta(epsilon)
+    min_delta = float(min_delta)
+    budget = AttackTimeBudget.from_timeout(timeout_seconds)
+
+    if time.monotonic() < budget.validate_end:
+        return final_validate_roundtrip(
+            model=model,
+            clean=clean,
+            adv=output.adv,
+            true_idx=true_idx,
+            min_delta=min_delta,
+            max_delta=max_delta,
+            accepted_groups=output.accepted_groups,
+            restore_adv_candidates=[output.pre_prune_adv],
+        ).clamp(0.0, 1.0)
+
+    return output.adv
+
+
+def finalize_miner_adversarial(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    attack_output: FeatureGuidedAttackOutput,
+    true_idx: int,
+    *,
+    min_delta: float,
+    max_delta: float,
+    deadline: float | None = None,
+    pgd_steps: int = 10,
+) -> tuple[torch.Tensor, PngRoundtripResult, FlipGapStats]:
+    """
+    Miner finalization: PGD fallback if needed, then PNG roundtrip verification.
+    """
+    adv = attack_output.adv
+    stats = attack_output.flip_stats or check_flip_and_gap(
+        model=model,
+        clean=clean,
+        adv=adv,
+        true_idx=true_idx,
+    )
+
+    if not stats.flipped and deadline is not None:
+        adv = pgd_fallback_attack(
+            model=model,
+            state=attack_output.fallback_state,
+            true_idx=true_idx,
+            max_delta=max_delta,
+            min_delta=min_delta,
+            deadline=deadline,
+            steps=pgd_steps,
+        )
+        stats = check_flip_and_gap(model=model, clean=clean, adv=adv, true_idx=true_idx)
+
+    roundtrip = png_roundtrip_verify(
+        model=model,
+        clean=clean,
+        adv=adv,
+        true_idx=true_idx,
+        min_delta=min_delta,
+        max_delta=max_delta,
+        accepted_groups=attack_output.accepted_groups,
+        restore_adv_candidates=[attack_output.pre_prune_adv],
+    )
+    final_stats = check_flip_and_gap(
+        model=model,
+        clean=clean,
+        adv=roundtrip.final_adv,
+        true_idx=true_idx,
+    )
+    return roundtrip.final_adv, roundtrip, final_stats
+
+
+# Miner-facing aliases matching the documented helper layout (step 16).
+get_topk_competitors = compute_top_k_competitors
+compute_gap_cam_for_competitor = compute_gap_cam
+compute_activation_gradient_map = compute_activation_gradient_maps
+feature_cell_to_raw_box = feature_cell_to_raw_image_box
+rank_regions = rank_competitor_regions
+select_pixels_in_region_box = select_pixels_in_region
+apply_pixel_batch = build_delta_try_from_changes
+test_pixel_batch = verify_trial_delta
+grow_region_verified = grow_ranked_region
+prune_accepted_groups = prune_validator_aware_state
+prune_pixel_chunks = prune_validator_aware_state
