@@ -7,9 +7,17 @@ import typing
 import bittensor as bt
 import torch
 
-from neurons.attack import feature_guided_sparse_untargeted_attack, inference_predict_index, inference_predict_label
+from neurons.attack import (
+    candidate_stats,
+    check_flip_and_gap,
+    finalize_miner_adversarial,
+    inference_predict_label,
+    resolve_attack_hyperparams,
+    run_feature_guided_attack,
+)
+from perturbnet.constants import MAX_LINF_DELTA
 from perturbnet.image_io import decode_image_b64, encode_image_b64
-from perturbnet.model import load_efficientnet_v2_l, resolve_target_index
+from perturbnet.model import load_efficientnet_v2_l, predict_index, resolve_target_index
 from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
@@ -157,8 +165,8 @@ class PerturbMiner:
             return synapse
 
         clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
-        target_index = resolve_target_index(synapse.true_label)
-        if target_index is None:
+        true_idx = resolve_target_index(synapse.true_label)
+        if true_idx is None:
             logger.warning(
                 f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unresolved true_label={getattr(synapse, 'true_label', None)}"
             )
@@ -168,23 +176,57 @@ class PerturbMiner:
         epsilon = float(synapse.epsilon)
         min_delta = float(getattr(synapse, "min_delta", 0.002))
         timeout_seconds = float(getattr(synapse, "timeout_seconds", 60))
+        effective_max = min(epsilon, float(MAX_LINF_DELTA))
+        deadline = time.monotonic() + timeout_seconds
+        attack_hyperparams = resolve_attack_hyperparams(os.getenv("PERTURB_ATTACK_PRESET"))
 
-        adv = feature_guided_sparse_untargeted_attack(
+        attack_output = run_feature_guided_attack(
             model=self.model,
             clean=clean,
-            true_idx=target_index,
-            epsilon=epsilon,
+            true_idx=true_idx,
+            epsilon=effective_max,
             min_delta=min_delta,
             timeout_seconds=timeout_seconds,
+            hyperparams=attack_hyperparams,
         )
-        final_pred = inference_predict_index(model=self.model, image_chw=adv)
-        final_label = inference_predict_label(model=self.model, image_chw=adv)
-        best_delta = float((adv - clean).abs().max().item())
-        synapse.perturbed_image_b64 = encode_image_b64(adv)
+
+        pre_stats = attack_output.flip_stats or check_flip_and_gap(
+            model=self.model,
+            clean=clean,
+            adv=attack_output.adv,
+            true_idx=true_idx,
+        )
+        pre_candidate = candidate_stats(clean, attack_output.adv)
+        pre_norm, pre_rmse = pre_candidate.norm, pre_candidate.rmse
+
+        final_adv, roundtrip, final_stats = finalize_miner_adversarial(
+            model=self.model,
+            clean=clean,
+            attack_output=attack_output,
+            true_idx=true_idx,
+            min_delta=min_delta,
+            max_delta=effective_max,
+            deadline=deadline,
+        )
+
+        encoded = encode_image_b64(final_adv)
+        decoded = decode_image_b64(encoded).to(self.device)
+        decoded_pred = predict_index(model=self.model, image_chw=decoded)
+        decoded_stats = candidate_stats(clean, decoded)
+
+        synapse.perturbed_image_b64 = encoded
+        final_label = inference_predict_label(model=self.model, image_chw=final_adv)
         logger.info(
-            f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={target_index} "
-            f"final_pred={final_pred} final_label={final_label} "
-            f"best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
+            f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={true_idx} "
+            f"attack_k={attack_hyperparams.top_k} beam={attack_hyperparams.beam_width} "
+            f"regions={attack_hyperparams.top_regions_per_competitor} "
+            f"batch={attack_hyperparams.region_grow_initial_batch}->{attack_hyperparams.region_grow_max_batch} "
+            f"pre_pred={pre_stats.pred_idx} pre_norm={pre_norm:.6f} pre_rmse={pre_rmse:.6f} "
+            f"final_pred={final_stats.pred_idx} final_label={final_label} "
+            f"roundtrip_pred={decoded_pred} roundtrip_norm={decoded_stats.norm:.6f} "
+            f"roundtrip_rmse={decoded_stats.rmse:.6f} roundtrip_ok={roundtrip.passed} "
+            f"roundtrip_restored={roundtrip.restored_from_backup} reason={roundtrip.reason} "
+            f"min_delta={min_delta:.6f} effective_max={effective_max:.6f}"
         )
         return synapse
 
@@ -300,4 +342,3 @@ def build_config() -> typing.Any:
 if __name__ == "__main__":
     miner = PerturbMiner(config=build_config())
     miner.run()
-
