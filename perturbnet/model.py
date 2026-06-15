@@ -41,6 +41,24 @@ def logits_for_images(model: torch.nn.Module, image_bchw: torch.Tensor) -> torch
     return model(_preprocess_for_efficientnet_v2_l(image_bchw))
 
 
+def forward_logits_features(
+    model: torch.nn.Module,
+    image_bchw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Forward pass returning classifier logits and final feature map A.
+
+    PREPROCESS(image) -> features -> avgpool -> classifier
+    For 480×480 preprocessed input, A is expected to be [1, 1280, 15, 15].
+    """
+    x_pre = _preprocess_for_efficientnet_v2_l(image_bchw)
+    features = model.features(x_pre)
+    pooled = model.avgpool(features)
+    flat = torch.flatten(pooled, 1)
+    logits = model.classifier(flat)
+    return logits, features
+
+
 def predict_label(model: torch.nn.Module, image_chw: torch.Tensor) -> str:
     idx = predict_index(model=model, image_chw=image_chw)
     if 0 <= idx < len(LABELS):
