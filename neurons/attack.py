@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from torchvision.transforms import Normalize
 
-from perturbnet.model import PREPROCESS
+from perturbnet.model import LABELS, PREPROCESS, WEIGHTS, load_efficientnet_v2_l
+
+logger = logging.getLogger(__name__)
+
+MODEL_INPUT_SIZE = 480
+EXPECTED_FEATURE_MAP_SHAPE = (1, 1280, 15, 15)
 
 # Derived from PREPROCESS (EfficientNetV2-L IMAGENET1K_V1): resize/crop 480, [0,1], normalize.
 _NORM_TRANSFORM: Normalize | None = None
@@ -21,6 +28,15 @@ NORM_STD = tuple(_NORM_TRANSFORM.std) if _NORM_TRANSFORM is not None else (0.5, 
 PIXEL_STEP_RAW = 1.0 / 255.0
 # Equivalent step after (x - 0.5) / 0.5 normalization.
 PIXEL_STEP_NORM = PIXEL_STEP_RAW / float(NORM_STD[0])
+
+
+@dataclass(frozen=True)
+class ModelSetup:
+    model: torch.nn.Module
+    weights: Any
+    preprocess: Any
+    categories: list[str]
+    feature_shape: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -128,6 +144,43 @@ def logits_from_raw(
 ) -> torch.Tensor:
     """Forward pass on raw-space tensor without re-running resize/center-crop."""
     return model(raw_to_model_input(x_raw=x_raw, delta_raw=delta_raw))
+
+
+def verify_feature_map_shape(model: torch.nn.Module, device: torch.device) -> tuple[int, ...]:
+    """Confirm model.features output for 480×480 input is [1, 1280, 15, 15]."""
+    model.eval()
+    with torch.no_grad():
+        probe = torch.zeros(1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, device=device)
+        features = model.features(probe)
+    shape = tuple(int(dim) for dim in features.shape)
+    if shape != EXPECTED_FEATURE_MAP_SHAPE:
+        raise RuntimeError(
+            f"Unexpected EfficientNetV2-L feature shape {shape}; "
+            f"expected {EXPECTED_FEATURE_MAP_SHAPE}"
+        )
+    return shape
+
+
+def setup_model(device: torch.device, *, verify_features: bool = True) -> ModelSetup:
+    """Load EfficientNetV2-L, weights, transforms, and class labels for the attack pipeline."""
+    model = load_efficientnet_v2_l(device)
+    categories = list(LABELS)
+    feature_shape: tuple[int, ...] = ()
+    if verify_features:
+        feature_shape = verify_feature_map_shape(model=model, device=device)
+        logger.info(
+            "setup_model verified feature map shape=%s for input=%sx%s",
+            feature_shape,
+            MODEL_INPUT_SIZE,
+            MODEL_INPUT_SIZE,
+        )
+    return ModelSetup(
+        model=model,
+        weights=WEIGHTS,
+        preprocess=PREPROCESS,
+        categories=categories,
+        feature_shape=feature_shape,
+    )
 
 
 def init_attack_state(
