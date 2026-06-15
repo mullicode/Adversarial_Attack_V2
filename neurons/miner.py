@@ -9,7 +9,6 @@ import torch
 
 from neurons.attack import (
     candidate_stats,
-    check_flip_and_gap,
     finalize_miner_adversarial,
     inference_predict_label,
     resolve_attack_hyperparams,
@@ -179,6 +178,8 @@ class PerturbMiner:
         effective_max = min(epsilon, float(MAX_LINF_DELTA))
         deadline = time.monotonic() + timeout_seconds
         attack_hyperparams = resolve_attack_hyperparams(os.getenv("PERTURB_ATTACK_PRESET"))
+        task_id = str(getattr(synapse, "task_id", "unknown"))
+        true_label = str(getattr(synapse, "true_label", "") or "")
 
         attack_output = run_feature_guided_attack(
             model=self.model,
@@ -188,16 +189,9 @@ class PerturbMiner:
             min_delta=min_delta,
             timeout_seconds=timeout_seconds,
             hyperparams=attack_hyperparams,
+            task_id=task_id,
+            true_label=true_label,
         )
-
-        pre_stats = attack_output.flip_stats or check_flip_and_gap(
-            model=self.model,
-            clean=clean,
-            adv=attack_output.adv,
-            true_idx=true_idx,
-        )
-        pre_candidate = candidate_stats(clean, attack_output.adv)
-        pre_norm, pre_rmse = pre_candidate.norm, pre_candidate.rmse
 
         final_adv, roundtrip, final_stats = finalize_miner_adversarial(
             model=self.model,
@@ -207,6 +201,7 @@ class PerturbMiner:
             min_delta=min_delta,
             max_delta=effective_max,
             deadline=deadline,
+            log_session=attack_output.log_session,
         )
 
         encoded = encode_image_b64(final_adv)
@@ -217,16 +212,16 @@ class PerturbMiner:
         synapse.perturbed_image_b64 = encoded
         final_label = inference_predict_label(model=self.model, image_chw=final_adv)
         logger.info(
-            f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={true_idx} "
+            f"Finished task={task_id} target_idx={true_idx} "
             f"attack_k={attack_hyperparams.top_k} beam={attack_hyperparams.beam_width} "
             f"regions={attack_hyperparams.top_regions_per_competitor} "
             f"batch={attack_hyperparams.region_grow_initial_batch}->{attack_hyperparams.region_grow_max_batch} "
-            f"pre_pred={pre_stats.pred_idx} pre_norm={pre_norm:.6f} pre_rmse={pre_rmse:.6f} "
             f"final_pred={final_stats.pred_idx} final_label={final_label} "
-            f"roundtrip_pred={decoded_pred} roundtrip_norm={decoded_stats.norm:.6f} "
-            f"roundtrip_rmse={decoded_stats.rmse:.6f} roundtrip_ok={roundtrip.passed} "
+            f"flipped={final_stats.flipped} gap={final_stats.untargeted_gap:.4f} "
+            f"roundtrip_pred={decoded_pred} roundtrip_ok={roundtrip.passed} "
             f"roundtrip_restored={roundtrip.restored_from_backup} reason={roundtrip.reason} "
-            f"min_delta={min_delta:.6f} effective_max={effective_max:.6f}"
+            f"min_delta={min_delta:.6f} effective_max={effective_max:.6f} "
+            f"(see [START]/[ATTACK]/[FLIP]/[PRUNE]/[ROUNDTRIP]/[FINAL] logs for full metrics)"
         )
         return synapse
 
