@@ -66,6 +66,9 @@ ATTACK_TIME_VALIDATE_FRACTION = 0.10
 ATTACK_TIME_BUFFER_FRACTION = 0.05
 ATTACK_SEARCH_ROUND_FRACTION = 0.75
 
+# Validator-score aware pruning chunk sizes (step 15).
+PRUNE_CHUNK_SIZES = (16, 8, 4, 1)
+
 
 @dataclass(frozen=True)
 class CompetitorEntry:
@@ -1184,9 +1187,7 @@ def grow_ranked_region(
             session.batch_size = _decrease_grow_batch_size(session.batch_size)
 
         if verification is not None and verification.flip_candidate:
-            session.stopped = True
             stopped_reason = "flip_found"
-            break
 
     if session.stopped and stopped_reason == "not_started":
         stopped_reason = "max_pixels" if session.pixels_applied >= pixel_cap else "done"
@@ -1248,8 +1249,6 @@ def grow_ranked_regions(
         if result.best_verification is not None and result.best_verification.flip_candidate:
             if best_flip is None or result.best_verification.norm < best_flip.norm:
                 best_flip = result.best_verification
-        if result.flip_found:
-            break
 
     return total_applied, best_flip
 
@@ -2283,8 +2282,8 @@ def run_beam_search_phase(
                         min_delta=min_delta,
                         max_delta=max_delta,
                         round_id=round_idx,
-                        deadline=budget.search_end,
-                        max_pixels_per_region=REGION_GROW_MAX_PIXELS_PER_REGION,
+                        deadline=None,
+                        max_pixels_per_region=REGION_GROW_INITIAL_BATCH,
                     )
                     if applied > 0:
                         recent_gain = 0.0
@@ -2396,11 +2395,344 @@ def deepen_beam_node(
     )
 
 
+def _region_group_key(group: AcceptedGroup) -> tuple[int, tuple[int, int], tuple[int, int, int, int]]:
+    return (group.competitor_idx, group.feature_cell, group.image_box)
+
+
+def _group_accepted_region_batches(
+    accepted_groups: list[AcceptedGroup],
+) -> list[tuple[tuple[int, tuple[int, int], tuple[int, int, int, int]], list[AcceptedGroup]]]:
+    grouped: dict[tuple[int, tuple[int, int], tuple[int, int, int, int]], list[AcceptedGroup]] = {}
+    for group in accepted_groups:
+        grouped.setdefault(_region_group_key(group), []).append(group)
+
+    region_groups: list[tuple[tuple[int, tuple[int, int], tuple[int, int, int, int]], list[AcceptedGroup]]] = []
+    for key, batches in grouped.items():
+        batches.sort(key=lambda batch: (batch.round_id, -batch.gain_per_pixel))
+        region_groups.append((key, batches))
+
+    region_groups.sort(
+        key=lambda item: (
+            sum(batch.gain for batch in item[1]),
+            sum(batch.gain_per_pixel for batch in item[1]),
+        )
+    )
+    return region_groups
+
+
+def delta_from_pixel_changes(
+    clean: torch.Tensor,
+    pixel_changes: list[PixelChange],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    delta = torch.zeros_like(clean)
+    changed_mask = torch.zeros_like(clean, dtype=torch.bool)
+    for change in pixel_changes:
+        step = float(change.direction) * PIXEL_STEP_RAW
+        delta[change.channel, change.y, change.x] += step
+        changed_mask[change.channel, change.y, change.x] = True
+    return delta, changed_mask
+
+
+def reverse_pixel_changes(
+    delta: torch.Tensor,
+    changed_mask: torch.Tensor,
+    pixel_changes: list[PixelChange],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    new_delta = delta.clone()
+    new_mask = changed_mask.clone()
+    for change in pixel_changes:
+        step = float(change.direction) * PIXEL_STEP_RAW
+        c, y, x = change.channel, change.y, change.x
+        new_delta[c, y, x] = new_delta[c, y, x] - step
+        if abs(float(new_delta[c, y, x].item())) <= 1e-12:
+            new_delta[c, y, x] = 0.0
+            new_mask[c, y, x] = False
+    return new_delta, new_mask
+
+
+def _removal_breaks_min_delta(
+    delta: torch.Tensor,
+    changed_mask: torch.Tensor,
+    pixel_changes: list[PixelChange],
+    *,
+    min_delta: float,
+) -> bool:
+    """Reject removals that drop Linf below validator min_delta floor."""
+    if not pixel_changes:
+        return False
+    trial_delta, _ = reverse_pixel_changes(delta, changed_mask, pixel_changes)
+    new_linf = float(trial_delta.abs().max().item())
+    return new_linf < float(min_delta) - 1e-9
+
+
+def _collect_pixels_newest_first(accepted_groups: list[AcceptedGroup]) -> list[PixelChange]:
+    pixels: list[PixelChange] = []
+    for batch in reversed(accepted_groups):
+        pixels.extend(batch.pixels)
+    return pixels
+
+
+def _prune_preserves_validator_flip(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    trial_delta: torch.Tensor,
+    true_idx: int,
+    *,
+    min_delta: float,
+    max_delta: float,
+) -> bool:
+    adv = (clean + trial_delta).clamp(0.0, 1.0)
+    return validator_passes_adv(
+        model=model,
+        clean=clean,
+        adv=adv,
+        true_idx=true_idx,
+        min_delta=min_delta,
+        max_delta=max_delta,
+    )
+
+
+def _commit_pruned_state(
+    model: torch.nn.Module,
+    state: AttackState,
+    trial_delta: torch.Tensor,
+    trial_mask: torch.Tensor,
+    accepted_groups: list[AcceptedGroup],
+    *,
+    top_k: int,
+) -> None:
+    state.delta = trial_delta.detach()
+    state.changed_mask = trial_mask.detach()
+    state.accepted_groups = list(accepted_groups)
+    refresh_state_logits(model=model, state=state, top_k=top_k)
+
+
+def prune_validator_aware_state(
+    model: torch.nn.Module,
+    state: AttackState,
+    *,
+    true_idx: int,
+    min_delta: float,
+    max_delta: float,
+    top_k: int = DEFAULT_TOP_K,
+    deadline: float | None = None,
+) -> AttackState:
+    """
+    Validator-score aware pruning (step 15).
+
+    A. Remove weakest accepted region groups whole
+    B. Remove later-added batches inside each region group
+    C. Remove pixel chunks (16 -> 8 -> 4 -> 1), newest first
+    D. Never drop Linf below min_delta
+    """
+    if not state.accepted_groups:
+        return state
+
+    adv = state.adv
+    if not validator_passes_adv(
+        model=model,
+        clean=state.clean,
+        adv=adv,
+        true_idx=true_idx,
+        min_delta=min_delta,
+        max_delta=max_delta,
+    ):
+        return state
+
+    remaining_groups = list(state.accepted_groups)
+
+    # A. Remove whole accepted region groups, weakest first.
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        region_groups = _group_accepted_region_batches(remaining_groups)
+        if not region_groups:
+            break
+
+        region_key, batches = region_groups[0]
+        pixels_to_remove = [pixel for batch in batches for pixel in batch.pixels]
+        if not pixels_to_remove:
+            remaining_groups = [
+                group for group in remaining_groups if _region_group_key(group) != region_key
+            ]
+            continue
+        if _removal_breaks_min_delta(state.delta, pixels_to_remove, min_delta=min_delta):
+            break
+
+        trial_delta, trial_mask = reverse_pixel_changes(
+            state.delta,
+            state.changed_mask,
+            pixels_to_remove,
+        )
+        if not _prune_preserves_validator_flip(
+            model=model,
+            clean=state.clean,
+            trial_delta=trial_delta,
+            true_idx=true_idx,
+            min_delta=min_delta,
+            max_delta=max_delta,
+        ):
+            break
+
+        remaining_groups = [group for group in remaining_groups if _region_group_key(group) != region_key]
+        _commit_pruned_state(
+            model=model,
+            state=state,
+            trial_delta=trial_delta,
+            trial_mask=trial_mask,
+            accepted_groups=remaining_groups,
+            top_k=top_k,
+        )
+
+    # B. Remove later-added batches inside each surviving region group.
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        region_groups = _group_accepted_region_batches(remaining_groups)
+        removed_any = False
+        for _region_key, batches in region_groups:
+            if len(batches) <= 1:
+                continue
+            batch = batches[-1]
+            if batch not in remaining_groups:
+                continue
+            if _removal_breaks_min_delta(state.delta, batch.pixels, min_delta=min_delta):
+                continue
+
+            trial_delta, trial_mask = reverse_pixel_changes(
+                state.delta,
+                state.changed_mask,
+                batch.pixels,
+            )
+            if not _prune_preserves_validator_flip(
+                model=model,
+                clean=state.clean,
+                trial_delta=trial_delta,
+                true_idx=true_idx,
+                min_delta=min_delta,
+                max_delta=max_delta,
+            ):
+                continue
+
+            remaining_groups = [group for group in remaining_groups if group is not batch]
+            _commit_pruned_state(
+                model=model,
+                state=state,
+                trial_delta=trial_delta,
+                trial_mask=trial_mask,
+                accepted_groups=remaining_groups,
+                top_k=top_k,
+            )
+            removed_any = True
+            break
+        if not removed_any:
+            break
+
+    # C. Remove pixel chunks newest-first at sizes 16 -> 8 -> 4 -> 1.
+    for chunk_size in PRUNE_CHUNK_SIZES:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+
+            ordered_pixels = _collect_pixels_newest_first(remaining_groups)
+            active_pixels = [
+                pixel
+                for pixel in ordered_pixels
+                if state.changed_mask[pixel.channel, pixel.y, pixel.x]
+            ]
+            if len(active_pixels) < chunk_size:
+                break
+
+            chunk = active_pixels[:chunk_size]
+            if _removal_breaks_min_delta(state.delta, chunk, min_delta=min_delta):
+                break
+
+            trial_delta, trial_mask = reverse_pixel_changes(
+                state.delta,
+                state.changed_mask,
+                chunk,
+            )
+            if not _prune_preserves_validator_flip(
+                model=model,
+                clean=state.clean,
+                trial_delta=trial_delta,
+                true_idx=true_idx,
+                min_delta=min_delta,
+                max_delta=max_delta,
+            ):
+                break
+
+            chunk_set = {(p.channel, p.y, p.x, p.direction) for p in chunk}
+            updated_groups: list[AcceptedGroup] = []
+            for group in remaining_groups:
+                kept_pixels = [
+                    pixel
+                    for pixel in group.pixels
+                    if (pixel.channel, pixel.y, pixel.x, pixel.direction) not in chunk_set
+                ]
+                if kept_pixels:
+                    updated_groups.append(
+                        AcceptedGroup(
+                            competitor_idx=group.competitor_idx,
+                            feature_cell=group.feature_cell,
+                            image_box=group.image_box,
+                            pixels=kept_pixels,
+                            gap_before=group.gap_before,
+                            gap_after=group.gap_after,
+                            gain=group.gain,
+                            gain_per_pixel=group.gain_per_pixel,
+                            round_id=group.round_id,
+                        )
+                    )
+            remaining_groups = updated_groups
+            _commit_pruned_state(
+                model=model,
+                state=state,
+                trial_delta=trial_delta,
+                trial_mask=trial_mask,
+                accepted_groups=remaining_groups,
+                top_k=top_k,
+            )
+
+    return state
+
+
+def prune_beam_node_validator_aware(
+    model: torch.nn.Module,
+    node: BeamNode,
+    *,
+    true_idx: int,
+    min_delta: float,
+    max_delta: float,
+    top_k: int,
+    deadline: float | None,
+) -> BeamNode:
+    pruned_state = prune_validator_aware_state(
+        model=model,
+        state=clone_attack_state(node.state),
+        true_idx=true_idx,
+        min_delta=min_delta,
+        max_delta=max_delta,
+        top_k=top_k,
+        deadline=deadline,
+    )
+    return build_beam_node(
+        pruned_state,
+        recent_gain_per_pixel=node.recent_gain_per_pixel,
+        round_id=node.round_id,
+        expansion_idx=node.expansion_idx,
+    )
+
+
 def prune_beam_candidates(
     model: torch.nn.Module,
     beam: list[BeamNode],
     *,
     true_idx: int,
+    epsilon: float,
     top_k: int,
     beam_width: int,
     min_delta: float,
@@ -2408,7 +2740,7 @@ def prune_beam_candidates(
     budget: AttackTimeBudget,
 ) -> list[BeamNode]:
     """
-    Re-score surviving paths and drop dominated candidates during the prune phase.
+    Re-score surviving paths, deepen, validator-aware prune, and drop dominated candidates.
     """
     if not beam:
         return beam
@@ -2445,6 +2777,27 @@ def prune_beam_candidates(
             )
         )
     refreshed = deepened
+
+    validator_pruned: list[BeamNode] = []
+    for candidate in refreshed:
+        if time.monotonic() >= budget.prune_end:
+            validator_pruned.append(candidate)
+            continue
+        if _is_valid_flip_node(candidate, min_delta=min_delta, max_delta=max_delta):
+            validator_pruned.append(
+                prune_beam_node_validator_aware(
+                    model=model,
+                    node=candidate,
+                    true_idx=true_idx,
+                    min_delta=min_delta,
+                    max_delta=max_delta,
+                    top_k=top_k,
+                    deadline=budget.prune_end,
+                )
+            )
+        else:
+            validator_pruned.append(candidate)
+    refreshed = validator_pruned
 
     refreshed.sort(key=lambda node: beam_rank_key(node, min_delta=min_delta, max_delta=max_delta))
 
@@ -2650,6 +3003,7 @@ def feature_guided_sparse_untargeted_attack(
             model=model,
             beam=beam,
             true_idx=true_idx,
+            epsilon=epsilon,
             top_k=int(top_k),
             beam_width=effective_beam_width,
             min_delta=min_delta,
@@ -2668,6 +3022,17 @@ def feature_guided_sparse_untargeted_attack(
         fallback_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
         adv = fallback_state.adv
     else:
+        if _is_valid_flip_node(best_node, min_delta=min_delta, max_delta=max_delta):
+            pruned_state = prune_validator_aware_state(
+                model=model,
+                state=clone_attack_state(best_node.state),
+                true_idx=true_idx,
+                min_delta=min_delta,
+                max_delta=max_delta,
+                top_k=int(top_k),
+                deadline=budget.validate_end,
+            )
+            best_node = build_beam_node(pruned_state)
         adv = best_node.adv
         fallback_state = clone_attack_state(best_node.state)
 
