@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Union
 
 import torch
+from PIL import Image
 from torchvision.transforms import Normalize
 
 from perturbnet.model import LABELS, PREPROCESS, WEIGHTS, load_efficientnet_v2_l
@@ -17,6 +18,8 @@ EXPECTED_RAW_BASE_SHAPE = (1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE)
 
 # Validator/RMSE constraint: each raw RGB channel may change by at most one ±1/255 step.
 PIXEL_STEP_RAW = 1.0 / 255.0
+
+ImageInput = Union[Image.Image, torch.Tensor]
 
 
 def _get_preprocess_mean_std(preprocess: Any) -> tuple[tuple[float, ...], tuple[float, ...]]:
@@ -143,20 +146,55 @@ def can_apply_pixel_change(x_raw: torch.Tensor, change: PixelChange) -> bool:
     return value >= PIXEL_STEP_RAW - 1e-9
 
 
-def chw_to_raw_base(image_chw: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """
-    Map decoded CHW image to raw model input [1,3,480,480] in [0,1].
+def normalize_raw(x_raw: torch.Tensor) -> torch.Tensor:
+    """Map raw [0,1] tensor to model input: (x_raw - mean) / std."""
+    mean, std = _mean_std_tensors(device=x_raw.device, dtype=x_raw.dtype)
+    return (x_raw - mean) / std
 
-    PREPROCESS returns a normalized tensor, so invert normalization to recover
-    the resized/cropped raw tensor.
-    """
-    x = image_chw.unsqueeze(0).to(device=device, dtype=torch.float32)
-    with torch.no_grad():
-        x_norm = PREPROCESS(x)
 
+def denormalize(x_norm: torch.Tensor) -> torch.Tensor:
+    """Recover raw [0,1] tensor from normalized model input."""
     mean, std = _mean_std_tensors(device=x_norm.device, dtype=x_norm.dtype)
-    x_raw = (x_norm * std + mean).clamp(0.0, 1.0)
+    return x_norm * std + mean
 
+
+def _ensure_bchw_float(image: torch.Tensor, device: torch.device) -> torch.Tensor:
+    x = image.to(device=device)
+    if x.ndim == 3:
+        x = x.unsqueeze(0)
+    elif x.ndim != 4:
+        raise ValueError(f"Expected CHW or BCHW tensor, got shape {tuple(x.shape)}")
+    if not torch.is_floating_point(x):
+        x = x.float()
+    elif x.dtype != torch.float32:
+        x = x.to(dtype=torch.float32)
+    if float(x.max()) > 1.0 + 1e-3:
+        x = x / 255.0
+    return x
+
+
+def _preprocess_normalized(image: ImageInput, device: torch.device) -> torch.Tensor:
+    """Run canonical PREPROCESS from perturbnet.model (same path as validator)."""
+    if isinstance(image, Image.Image):
+        x_in: Any = image.convert("RGB")
+    else:
+        x_in = _ensure_bchw_float(image, device=device)
+
+    with torch.no_grad():
+        x_norm = PREPROCESS(x_in)
+    if x_norm.ndim == 3:
+        x_norm = x_norm.unsqueeze(0)
+    return x_norm.to(device=device, dtype=torch.float32)
+
+
+def preprocess_to_raw_480(image: ImageInput, device: torch.device) -> torch.Tensor:
+    """
+    Convert PIL or tensor image to raw model input [1,3,480,480] before normalization.
+
+    Uses PREPROCESS from perturbnet.model for resize/crop/normalize, then denormalize
+    to recover the raw [0,1] tensor where ±1/255 perturbations are applied.
+    """
+    x_raw = denormalize(_preprocess_normalized(image=image, device=device))
     if tuple(x_raw.shape) != EXPECTED_RAW_BASE_SHAPE:
         raise RuntimeError(
             f"Unexpected raw base shape {tuple(x_raw.shape)}; expected {EXPECTED_RAW_BASE_SHAPE}"
@@ -164,15 +202,20 @@ def chw_to_raw_base(image_chw: torch.Tensor, device: torch.device) -> torch.Tens
     return x_raw
 
 
+def chw_to_raw_base(image_chw: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Backward-compatible alias for decoded CHW images."""
+    return preprocess_to_raw_480(image_chw, device=device)
+
+
 def raw_to_model_input(
     x_raw: torch.Tensor,
     delta_raw: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Normalize raw [0,1] image tensor for EfficientNetV2-L: (x - mean) / std."""
+    """Normalize raw tensor before model forward; clamp only when delta is applied."""
     x = x_raw if delta_raw is None else x_raw + delta_raw
-    x = x.clamp(0.0, 1.0)
-    mean, std = _mean_std_tensors(device=x.device, dtype=x.dtype)
-    return (x - mean) / std
+    if delta_raw is not None:
+        x = x.clamp(0.0, 1.0)
+    return normalize_raw(x)
 
 
 def logits_from_raw(
@@ -230,7 +273,7 @@ def init_attack_state(
     device: torch.device,
 ) -> AttackState:
     """Beginning step: build raw-base tensors and baseline logits/gap for the attack loop."""
-    x_raw_base = chw_to_raw_base(image_chw=image_chw, device=device)
+    x_raw_base = preprocess_to_raw_480(image=image_chw, device=device)
     delta_raw = torch.zeros_like(x_raw_base)
     changed_mask = torch.zeros_like(x_raw_base, dtype=torch.bool)
     with torch.no_grad():
