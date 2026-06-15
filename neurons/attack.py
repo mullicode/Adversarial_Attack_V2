@@ -124,7 +124,7 @@ ATTACK_PRESET_STRONG = AttackHyperparams(
     shrink_beam_on_short_timeout=False,
 )
 
-DEFAULT_ATTACK_HYPERPARAMS = ATTACK_PRESET_STRONG
+DEFAULT_ATTACK_HYPERPARAMS = ATTACK_PRESET_DEFAULT
 
 
 def resolve_attack_hyperparams(preset: str | None = None) -> AttackHyperparams:
@@ -133,15 +133,15 @@ def resolve_attack_hyperparams(preset: str | None = None) -> AttackHyperparams:
 
     Presets: fast | default | strong (offline)
     """
-    name = (preset or os.getenv("PERTURB_ATTACK_PRESET") or "strong").strip().lower()
+    name = (preset or os.getenv("PERTURB_ATTACK_PRESET") or "default").strip().lower()
     if name in {"fast", "quick", "subnet"}:
         return ATTACK_PRESET_FAST
     if name in {"default", "balanced", "starting", "start"}:
         return ATTACK_PRESET_DEFAULT
     if name in {"strong", "offline", "quality"}:
         return ATTACK_PRESET_STRONG
-    logger.warning("Unknown attack preset %r; using strong offline defaults", name)
-    return DEFAULT_ATTACK_HYPERPARAMS
+    logger.warning("Unknown attack preset %r; using default live-miner profile", name)
+    return ATTACK_PRESET_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -807,6 +807,23 @@ def build_delta_try_from_changes(
     return delta_try
 
 
+def is_gap_close_to_flip(gap_after: float, gap_before: float) -> bool:
+    """True when competitor gap is near crossing zero (flip imminent)."""
+    if gap_after <= float(REGION_GROW_CLOSE_TO_FLIP_GAP):
+        return True
+    if gap_before > 1e-9:
+        return gap_after <= float(gap_before) * float(REGION_GROW_CLOSE_TO_FLIP_RATIO)
+    return gap_after <= float(REGION_GROW_CLOSE_TO_FLIP_GAP)
+
+
+def classify_region_gain_strength(real_gain: float, gain_per_pixel: float) -> str:
+    if real_gain <= 0.0:
+        return "zero"
+    if gain_per_pixel >= float(REGION_GROW_STRONG_GAIN_PER_PIXEL):
+        return "strong"
+    return "weak"
+
+
 def verify_trial_delta(
     model: torch.nn.Module,
     state: AttackState,
@@ -846,13 +863,24 @@ def verify_trial_delta(
     value_ok = float(adv_try.min().item()) >= -1e-9 and float(adv_try.max().item()) <= 1.0 + 1e-9
     norm_ok = norm <= max_norm + 1e-9
     untargeted_improved = untargeted_gap_after < untargeted_gap_before - 1e-9
+    competitor_gain_ok = (
+        real_gain > 0.0 and gain_per_pixel >= float(min_gain_per_pixel)
+    )
+    strong_competitor_gain = (
+        competitor_gain_ok
+        and classify_region_gain_strength(real_gain, gain_per_pixel) == "strong"
+    )
+    competitor_close_to_flip = competitor_gain_ok and is_gap_close_to_flip(gap_after, gap_before)
 
     progress_accept = (
-        real_gain > 0.0
-        and gain_per_pixel >= float(min_gain_per_pixel)
-        and untargeted_improved
+        competitor_gain_ok
         and norm_ok
         and value_ok
+        and (
+            untargeted_improved
+            or strong_competitor_gain
+            or competitor_close_to_flip
+        )
     )
 
     flipped = pred_idx != true_idx
@@ -877,10 +905,12 @@ def verify_trial_delta(
         reason = "value_out_of_range"
     elif real_gain <= 0.0:
         reason = "no_real_gain"
-    elif not untargeted_improved:
-        reason = "untargeted_gap_not_improved"
     elif gain_per_pixel < float(min_gain_per_pixel):
         reason = "weak_gain_per_pixel"
+    elif not untargeted_improved and not strong_competitor_gain and not competitor_close_to_flip:
+        reason = "competitor_gain_not_strong_enough"
+    elif not untargeted_improved:
+        reason = "competitor_specific_gain"
     else:
         reason = "rejected"
 
@@ -1058,23 +1088,6 @@ def _decrease_grow_batch_size(batch_size: int) -> int:
     return _clamp_grow_batch_size(max(REGION_GROW_MIN_BATCH, batch_size // 2))
 
 
-def is_gap_close_to_flip(gap_after: float, gap_before: float) -> bool:
-    """True when competitor gap is near crossing zero (flip imminent)."""
-    if gap_after <= float(REGION_GROW_CLOSE_TO_FLIP_GAP):
-        return True
-    if gap_before > 1e-9:
-        return gap_after <= float(gap_before) * float(REGION_GROW_CLOSE_TO_FLIP_RATIO)
-    return gap_after <= float(REGION_GROW_CLOSE_TO_FLIP_GAP)
-
-
-def classify_region_gain_strength(real_gain: float, gain_per_pixel: float) -> str:
-    if real_gain <= 0.0:
-        return "zero"
-    if gain_per_pixel >= float(REGION_GROW_STRONG_GAIN_PER_PIXEL):
-        return "strong"
-    return "weak"
-
-
 def should_accept_region_growth_batch(
     verification: TrialVerification,
     *,
@@ -1240,16 +1253,20 @@ def grow_ranked_region(
     round_id: int = 0,
     deadline: float | None = None,
     max_pixels: int | None = None,
+    initial_batch: int | None = None,
     log_session: AttackLogSession | None = None,
     beam_id: int | None = None,
 ) -> RegionGrowResult:
     """
     Seed then adaptively grow one ranked region in verified pixel batches.
 
-    Stops on saturation (gain <= 0), two consecutive failures, pixel cap, or budget.
+    Stops on flip, saturation (gain <= 0), two consecutive failures, pixel cap, or budget.
     """
     pixel_cap = int(max_pixels) if max_pixels is not None else REGION_GROW_MAX_PIXELS_PER_REGION
-    session = RegionGrowSession(region=region, batch_size=REGION_GROW_INITIAL_BATCH)
+    session = RegionGrowSession(
+        region=region,
+        batch_size=int(initial_batch or REGION_GROW_INITIAL_BATCH),
+    )
     gap_before = competitor_gap(state.logits.unsqueeze(0), true_idx, competitor_idx)
     untargeted_gap_before = untargeted_gap(state.logits.unsqueeze(0), true_idx)
     best_verification: TrialVerification | None = None
@@ -1340,6 +1357,8 @@ def grow_ranked_region(
 
         if verification is not None and verification.flip_candidate:
             stopped_reason = "flip_found"
+            session.stopped = True
+            break
 
     if session.stopped and stopped_reason == "not_started":
         stopped_reason = "max_pixels" if session.pixels_applied >= pixel_cap else "done"
@@ -1412,6 +1431,9 @@ def grow_ranked_regions(
         if result.best_verification is not None and result.best_verification.flip_candidate:
             if best_flip is None or result.best_verification.norm < best_flip.norm:
                 best_flip = result.best_verification
+            break
+        if result.stopped_reason == "flip_found":
+            break
 
     return total_applied, best_flip
 
@@ -2250,6 +2272,7 @@ def expand_beam_node(
     round_id: int,
     deadline: float | None,
     region_grow_initial_batch: int = REGION_GROW_INITIAL_BATCH,
+    region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION,
     log_session: AttackLogSession | None = None,
     beam_id: int | None = None,
 ) -> BeamNode | None:
@@ -2325,8 +2348,9 @@ def expand_beam_node(
             min_delta=min_delta,
             max_delta=max_delta,
             round_id=round_id,
-            deadline=None,
-            max_pixels=region_grow_initial_batch,
+            deadline=deadline,
+            max_pixels=region_grow_max_pixels_per_region,
+            initial_batch=region_grow_initial_batch,
             log_session=log_session,
             beam_id=beam_id,
         )
@@ -2406,6 +2430,7 @@ def run_beam_search_phase(
                 round_id=round_idx,
                 deadline=budget.search_end,
                 region_grow_initial_batch=region_grow_initial_batch,
+                region_grow_max_pixels_per_region=region_grow_max_pixels_per_region,
                 log_session=log_session,
                 beam_id=beam_idx,
             )
@@ -2466,8 +2491,8 @@ def run_beam_search_phase(
                         min_delta=min_delta,
                         max_delta=max_delta,
                         round_id=round_idx,
-                        deadline=None,
-                        max_pixels_per_region=region_grow_initial_batch,
+                        deadline=budget.search_end,
+                        max_pixels_per_region=region_grow_max_pixels_per_region,
                     )
                     if applied > 0:
                         recent_gain = 0.0
@@ -2747,40 +2772,49 @@ def prune_validator_aware_state(
         if not region_groups:
             break
 
-        region_key, batches = region_groups[0]
-        pixels_to_remove = [pixel for batch in batches for pixel in batch.pixels]
-        if not pixels_to_remove:
+        removed_any = False
+        for region_key, batches in region_groups:
+            pixels_to_remove = [pixel for batch in batches for pixel in batch.pixels]
+            if not pixels_to_remove:
+                remaining_groups = [
+                    group for group in remaining_groups if _region_group_key(group) != region_key
+                ]
+                removed_any = True
+                break
+            if _removal_breaks_min_delta(state.delta, pixels_to_remove, min_delta=min_delta):
+                continue
+
+            trial_delta, trial_mask = reverse_pixel_changes(
+                state.delta,
+                state.changed_mask,
+                pixels_to_remove,
+            )
+            if not _prune_preserves_validator_flip(
+                model=model,
+                clean=state.clean,
+                trial_delta=trial_delta,
+                true_idx=true_idx,
+                min_delta=min_delta,
+                max_delta=max_delta,
+            ):
+                continue
+
             remaining_groups = [
                 group for group in remaining_groups if _region_group_key(group) != region_key
             ]
-            continue
-        if _removal_breaks_min_delta(state.delta, pixels_to_remove, min_delta=min_delta):
+            _commit_pruned_state(
+                model=model,
+                state=state,
+                trial_delta=trial_delta,
+                trial_mask=trial_mask,
+                accepted_groups=remaining_groups,
+                top_k=top_k,
+            )
+            removed_any = True
             break
 
-        trial_delta, trial_mask = reverse_pixel_changes(
-            state.delta,
-            state.changed_mask,
-            pixels_to_remove,
-        )
-        if not _prune_preserves_validator_flip(
-            model=model,
-            clean=state.clean,
-            trial_delta=trial_delta,
-            true_idx=true_idx,
-            min_delta=min_delta,
-            max_delta=max_delta,
-        ):
+        if not removed_any:
             break
-
-        remaining_groups = [group for group in remaining_groups if _region_group_key(group) != region_key]
-        _commit_pruned_state(
-            model=model,
-            state=state,
-            trial_delta=trial_delta,
-            trial_mask=trial_mask,
-            accepted_groups=remaining_groups,
-            top_k=top_k,
-        )
 
     # B. Remove later-added batches inside each surviving region group.
     while True:
@@ -2844,56 +2878,64 @@ def prune_validator_aware_state(
             if len(active_pixels) < chunk_size:
                 break
 
-            chunk = active_pixels[:chunk_size]
-            if _removal_breaks_min_delta(state.delta, chunk, min_delta=min_delta):
-                break
+            removed_any = False
+            max_start = max(0, len(active_pixels) - chunk_size)
+            for start_idx in range(0, max_start + 1, chunk_size):
+                chunk = active_pixels[start_idx : start_idx + chunk_size]
+                if _removal_breaks_min_delta(state.delta, chunk, min_delta=min_delta):
+                    continue
 
-            trial_delta, trial_mask = reverse_pixel_changes(
-                state.delta,
-                state.changed_mask,
-                chunk,
-            )
-            if not _prune_preserves_validator_flip(
-                model=model,
-                clean=state.clean,
-                trial_delta=trial_delta,
-                true_idx=true_idx,
-                min_delta=min_delta,
-                max_delta=max_delta,
-            ):
-                break
+                trial_delta, trial_mask = reverse_pixel_changes(
+                    state.delta,
+                    state.changed_mask,
+                    chunk,
+                )
+                if not _prune_preserves_validator_flip(
+                    model=model,
+                    clean=state.clean,
+                    trial_delta=trial_delta,
+                    true_idx=true_idx,
+                    min_delta=min_delta,
+                    max_delta=max_delta,
+                ):
+                    continue
 
-            chunk_set = {(p.channel, p.y, p.x, p.direction) for p in chunk}
-            updated_groups: list[AcceptedGroup] = []
-            for group in remaining_groups:
-                kept_pixels = [
-                    pixel
-                    for pixel in group.pixels
-                    if (pixel.channel, pixel.y, pixel.x, pixel.direction) not in chunk_set
-                ]
-                if kept_pixels:
-                    updated_groups.append(
-                        AcceptedGroup(
-                            competitor_idx=group.competitor_idx,
-                            feature_cell=group.feature_cell,
-                            image_box=group.image_box,
-                            pixels=kept_pixels,
-                            gap_before=group.gap_before,
-                            gap_after=group.gap_after,
-                            gain=group.gain,
-                            gain_per_pixel=group.gain_per_pixel,
-                            round_id=group.round_id,
+                chunk_set = {(p.channel, p.y, p.x, p.direction) for p in chunk}
+                updated_groups: list[AcceptedGroup] = []
+                for group in remaining_groups:
+                    kept_pixels = [
+                        pixel
+                        for pixel in group.pixels
+                        if (pixel.channel, pixel.y, pixel.x, pixel.direction) not in chunk_set
+                    ]
+                    if kept_pixels:
+                        updated_groups.append(
+                            AcceptedGroup(
+                                competitor_idx=group.competitor_idx,
+                                feature_cell=group.feature_cell,
+                                image_box=group.image_box,
+                                pixels=kept_pixels,
+                                gap_before=group.gap_before,
+                                gap_after=group.gap_after,
+                                gain=group.gain,
+                                gain_per_pixel=group.gain_per_pixel,
+                                round_id=group.round_id,
+                            )
                         )
-                    )
-            remaining_groups = updated_groups
-            _commit_pruned_state(
-                model=model,
-                state=state,
-                trial_delta=trial_delta,
-                trial_mask=trial_mask,
-                accepted_groups=remaining_groups,
-                top_k=top_k,
-            )
+                remaining_groups = updated_groups
+                _commit_pruned_state(
+                    model=model,
+                    state=state,
+                    trial_delta=trial_delta,
+                    trial_mask=trial_mask,
+                    accepted_groups=remaining_groups,
+                    top_k=top_k,
+                )
+                removed_any = True
+                break
+
+            if not removed_any:
+                break
 
     after_snap = build_validator_snapshot(
         logits=state.logits,

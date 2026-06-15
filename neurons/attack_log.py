@@ -130,11 +130,11 @@ class AttackLogSession:
         excel_enabled: bool | None = None,
     ) -> AttackLogSession:
         if excel_enabled is None:
-            excel_enabled = os.getenv("ATTACK_LOG_EXCEL", "1").strip().lower() not in {
-                "0",
-                "false",
-                "no",
-                "off",
+            excel_enabled = os.getenv("ATTACK_LOG_EXCEL", "0").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
             }
         start = time.monotonic()
         session = cls(

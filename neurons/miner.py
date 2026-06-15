@@ -223,7 +223,7 @@ class PerturbMiner:
                     "top_regions": attack_hyperparams.top_regions_per_competitor,
                     "region_grow_initial_batch": attack_hyperparams.region_grow_initial_batch,
                     "region_grow_max_batch": attack_hyperparams.region_grow_max_batch,
-                    "attack_preset": os.getenv("PERTURB_ATTACK_PRESET", "strong"),
+                    "attack_preset": os.getenv("PERTURB_ATTACK_PRESET", "default"),
                     "timeout_seconds": timeout_seconds,
                     "roundtrip_ok": roundtrip.passed,
                     "roundtrip_reason": roundtrip.reason,
