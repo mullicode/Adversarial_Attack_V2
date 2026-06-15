@@ -8,6 +8,7 @@ import bittensor as bt
 import torch
 import torch.nn.functional as F
 
+from neurons.attack import init_attack_state, is_flip_success
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, resolve_target_index
 from perturbnet.protocol import AttackChallenge
@@ -167,6 +168,20 @@ class PerturbMiner:
 
         epsilon = float(synapse.epsilon)
         min_delta = float(getattr(synapse, "min_delta", 0.002))
+
+        attack_state = init_attack_state(
+            model=self.model,
+            image_chw=clean,
+            true_idx=target_index,
+            device=self.device,
+        )
+        logger.info(
+            f"Attack init task={getattr(synapse, 'task_id', 'unknown')} "
+            f"true_idx={target_index} competitor_idx={attack_state.current_competitor_idx} "
+            f"gap={attack_state.current_gap:.6f} "
+            f"already_flipped={is_flip_success(attack_state.current_logits, target_index)} "
+            f"raw_shape={tuple(attack_state.x_raw_base.shape)}"
+        )
 
         # Basic default algorithm: small-step untargeted PGD.
         steps = 10
