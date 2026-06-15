@@ -13,7 +13,7 @@ from perturbnet.constants import MAX_LINF_DELTA, MIN_LINF_DELTA, MIN_PSNR_DB, MI
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import forward_logits_features, logits_for_images, predict_index, predict_label
 
-from neurons.attack_log import AttackLogSession, build_validator_snapshot
+from neurons.attack_log import AttackLogSession, build_validator_snapshot, idx_label
 
 logger = logging.getLogger(__name__)
 
@@ -2381,15 +2381,10 @@ def run_beam_search_phase(
             break
 
         if log_session is not None:
+            logits_source = beam[0].state.logits if beam else initial_state.logits
             with torch.no_grad():
                 race = compute_top_k_competitors(
-                    logits=initial_state.logits.unsqueeze(0),
-                    true_idx=true_idx,
-                    k=top_k,
-                )
-            if beam:
-                race = compute_top_k_competitors(
-                    logits=beam[0].state.logits.unsqueeze(0),
+                    logits=logits_source.unsqueeze(0),
                     true_idx=true_idx,
                     k=top_k,
                 )
@@ -2912,6 +2907,9 @@ def prune_validator_aware_state(
         log_session.log_accepted_groups(state.accepted_groups)
 
     return state
+
+
+def prune_beam_node_validator_aware(
     model: torch.nn.Module,
     node: BeamNode,
     *,
@@ -2920,6 +2918,7 @@ def prune_validator_aware_state(
     max_delta: float,
     top_k: int,
     deadline: float | None,
+    log_session: AttackLogSession | None = None,
 ) -> BeamNode:
     pruned_state = prune_validator_aware_state(
         model=model,
@@ -2929,6 +2928,7 @@ def prune_validator_aware_state(
         max_delta=max_delta,
         top_k=top_k,
         deadline=deadline,
+        log_session=log_session,
     )
     return build_beam_node(
         pruned_state,
@@ -3363,6 +3363,9 @@ def run_feature_guided_attack(
     beam_width: int | None = None,
     top_regions: int | None = None,
     flip_margin_before_prune: float | None = None,
+    task_id: str = "unknown",
+    true_label: str = "",
+    log_session: AttackLogSession | None = None,
 ) -> FeatureGuidedAttackOutput:
     """
     Full feature-guided attack with metadata for miner finalization (steps 4-7).
@@ -3393,6 +3396,31 @@ def run_feature_guided_attack(
     if hp.shrink_beam_on_short_timeout and float(timeout_seconds) <= float(TIMEOUT_SECONDS):
         effective_beam_width = min(resolved_beam_width, ATTACK_PRESET_FAST.beam_width)
 
+    session = log_session
+    if session is None:
+        session = AttackLogSession.create(
+            task_id=task_id,
+            true_idx=true_idx,
+            true_label=true_label or idx_label(true_idx),
+            min_delta=min_delta,
+            epsilon=float(epsilon),
+            effective_max_delta=max_delta,
+            timeout_seconds=float(timeout_seconds),
+            budget=budget,
+        )
+
+    initial_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
+    start_snap = build_validator_snapshot(
+        logits=initial_state.logits,
+        true_idx=true_idx,
+        clean=clean,
+        adv=initial_state.adv,
+        changed_mask=initial_state.changed_mask,
+    )
+    session.log_validator_snapshot(start_snap, prefix="[START]")
+
+    pgd_used = False
+
     beam, best_flip = run_beam_search_phase(
         model=model,
         clean=clean,
@@ -3406,6 +3434,7 @@ def run_feature_guided_attack(
         max_rounds=int(steps),
         region_grow_initial_batch=hp.region_grow_initial_batch,
         region_grow_max_pixels_per_region=hp.region_grow_max_pixels_per_region,
+        log_session=session,
     )
 
     if time.monotonic() < budget.prune_end:
@@ -3421,6 +3450,7 @@ def run_feature_guided_attack(
             budget=budget,
             top_regions=resolved_top_regions,
             region_grow_max_pixels_per_region=hp.region_grow_max_pixels_per_region,
+            log_session=session,
         )
 
     best_node = select_best_beam_node(
@@ -3451,6 +3481,7 @@ def run_feature_guided_attack(
                 max_delta=max_delta,
                 top_k=resolved_top_k,
                 deadline=budget.validate_end,
+                log_session=session,
             )
             best_node = build_beam_node(pruned_state)
         adv = best_node.adv
@@ -3467,6 +3498,7 @@ def run_feature_guided_attack(
         min_delta=min_delta,
         max_delta=max_delta,
     ):
+        pgd_used = True
         adv = pgd_fallback_attack(
             model=model,
             state=fallback_state,
@@ -3478,12 +3510,42 @@ def run_feature_guided_attack(
         )
         flip_stats = check_flip_and_gap(model=model, clean=clean, adv=adv, true_idx=true_idx)
 
+    post_ssim: float | None = None
+    post_psnr: float | None = None
+    if flip_stats.flipped:
+        post_ssim = compute_ssim(clean, adv)
+        post_psnr = compute_psnr_db(clean, adv)
+
+    post_snap = build_validator_snapshot(
+        logits=flip_stats.logits,
+        true_idx=true_idx,
+        clean=clean,
+        adv=adv,
+        changed_mask=(adv - clean).abs() > 1e-12,
+        ssim=post_ssim,
+        psnr_db=post_psnr,
+    )
+    session.log_validator_snapshot(post_snap, prefix="[POST_ATTACK]")
+    if post_snap.flipped and not session.flip_logged:
+        session.log_flip(
+            pred_idx=post_snap.pred_idx,
+            norm_linf=post_snap.norm_linf,
+            rmse=post_snap.rmse,
+            margin=post_snap.margin,
+            changed_pixel_channels=post_snap.changed_pixel_channels,
+            ssim=post_ssim,
+            psnr_db=post_psnr,
+        )
+    session.log_accepted_groups(accepted_groups)
+    session.pgd_used = pgd_used
+
     return FeatureGuidedAttackOutput(
         adv=adv.clamp(0.0, 1.0),
         pre_prune_adv=pre_prune_adv.clamp(0.0, 1.0),
         accepted_groups=accepted_groups,
         fallback_state=fallback_state,
         flip_stats=flip_stats,
+        log_session=session,
     )
 
 
@@ -3552,10 +3614,14 @@ def finalize_miner_adversarial(
     max_delta: float,
     deadline: float | None = None,
     pgd_steps: int = 10,
+    log_session: AttackLogSession | None = None,
 ) -> tuple[torch.Tensor, PngRoundtripResult, FlipGapStats]:
     """
     Miner finalization: PGD fallback if needed, then PNG roundtrip verification.
     """
+    session = log_session or attack_output.log_session
+    pgd_used = bool(session.pgd_used) if session is not None else False
+
     adv = attack_output.adv
     stats = attack_output.flip_stats or check_flip_and_gap(
         model=model,
@@ -3565,6 +3631,7 @@ def finalize_miner_adversarial(
     )
 
     if not stats.flipped and deadline is not None:
+        pgd_used = True
         adv = pgd_fallback_attack(
             model=model,
             state=attack_output.fallback_state,
@@ -3575,6 +3642,8 @@ def finalize_miner_adversarial(
             steps=pgd_steps,
         )
         stats = check_flip_and_gap(model=model, clean=clean, adv=adv, true_idx=true_idx)
+        if session is not None:
+            session.pgd_used = True
 
     roundtrip = png_roundtrip_verify(
         model=model,
@@ -3592,6 +3661,37 @@ def finalize_miner_adversarial(
         adv=roundtrip.final_adv,
         true_idx=true_idx,
     )
+
+    if session is not None:
+        rt_ssim: float | None = None
+        rt_psnr: float | None = None
+        if final_stats.flipped:
+            rt_ssim = compute_ssim(clean, roundtrip.final_adv)
+            rt_psnr = compute_psnr_db(clean, roundtrip.final_adv)
+        rt_margin = -float(final_stats.untargeted_gap)
+        session.log_roundtrip(
+            pred_idx=roundtrip.pred_idx,
+            flipped=roundtrip.pred_idx != true_idx,
+            norm_linf=roundtrip.norm,
+            rmse=roundtrip.rmse,
+            margin=rt_margin,
+            passed=roundtrip.passed,
+            restored_from_backup=roundtrip.restored_from_backup,
+            reason=roundtrip.reason,
+            ssim=rt_ssim,
+            psnr_db=rt_psnr,
+        )
+        final_snap = build_validator_snapshot(
+            logits=final_stats.logits,
+            true_idx=true_idx,
+            clean=clean,
+            adv=roundtrip.final_adv,
+            changed_mask=(roundtrip.final_adv - clean).abs() > 1e-12,
+            ssim=rt_ssim,
+            psnr_db=rt_psnr,
+        )
+        session.log_final_validation(final_snap, pgd_used=pgd_used)
+
     return roundtrip.final_adv, roundtrip, final_stats
 
 
