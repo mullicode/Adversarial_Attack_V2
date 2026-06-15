@@ -13,21 +13,38 @@ logger = logging.getLogger(__name__)
 
 MODEL_INPUT_SIZE = 480
 EXPECTED_FEATURE_MAP_SHAPE = (1, 1280, 15, 15)
+EXPECTED_RAW_BASE_SHAPE = (1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE)
 
-# Derived from PREPROCESS (EfficientNetV2-L IMAGENET1K_V1): resize/crop 480, [0,1], normalize.
-_NORM_TRANSFORM: Normalize | None = None
-for _transform in getattr(PREPROCESS, "transforms", ()):
-    if isinstance(_transform, Normalize):
-        _NORM_TRANSFORM = _transform
-        break
-
-NORM_MEAN = tuple(_NORM_TRANSFORM.mean) if _NORM_TRANSFORM is not None else (0.5, 0.5, 0.5)
-NORM_STD = tuple(_NORM_TRANSFORM.std) if _NORM_TRANSFORM is not None else (0.5, 0.5, 0.5)
-
-# Perturb in raw [0,1] space; validator measures pixel diffs in this space.
+# Validator/RMSE constraint: each raw RGB channel may change by at most one ±1/255 step.
 PIXEL_STEP_RAW = 1.0 / 255.0
-# Equivalent step after (x - 0.5) / 0.5 normalization.
-PIXEL_STEP_NORM = PIXEL_STEP_RAW / float(NORM_STD[0])
+
+
+def _get_preprocess_mean_std(preprocess: Any) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    mean = getattr(preprocess, "mean", None)
+    std = getattr(preprocess, "std", None)
+    if mean is not None and std is not None:
+        return tuple(float(v) for v in mean), tuple(float(v) for v in std)
+
+    for transform in getattr(preprocess, "transforms", ()):
+        if isinstance(transform, Normalize):
+            return (
+                tuple(float(v) for v in transform.mean),
+                tuple(float(v) for v in transform.std),
+            )
+
+    raise RuntimeError("Could not extract mean/std from PREPROCESS.")
+
+
+NORM_MEAN, NORM_STD = _get_preprocess_mean_std(PREPROCESS)
+
+
+def _mean_std_tensors(
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = torch.tensor(NORM_MEAN, device=device, dtype=dtype).view(1, 3, 1, 1)
+    std = torch.tensor(NORM_STD, device=device, dtype=dtype).view(1, 3, 1, 1)
+    return mean, std
 
 
 @dataclass(frozen=True)
@@ -107,34 +124,55 @@ def is_flip_success(logits: torch.Tensor, true_idx: int) -> bool:
 
 def can_apply_pixel_change(x_raw: torch.Tensor, change: PixelChange) -> bool:
     """Skip saturated pixels so ±1/255 steps are real changes, not clamp no-ops."""
+    if change.direction not in (-1, 1):
+        return False
+    if x_raw.ndim != 4:
+        return False
+
+    _, channel_count, height, width = x_raw.shape
+    if not (0 <= change.channel < channel_count):
+        return False
+    if not (0 <= change.y < height):
+        return False
+    if not (0 <= change.x < width):
+        return False
+
     value = float(x_raw[0, change.channel, change.y, change.x].item())
     if change.direction == 1:
         return value <= 1.0 - PIXEL_STEP_RAW + 1e-9
-    if change.direction == -1:
-        return value >= PIXEL_STEP_RAW - 1e-9
-    return False
+    return value >= PIXEL_STEP_RAW - 1e-9
 
 
 def chw_to_raw_base(image_chw: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Map decoded CHW image to raw model input in [0,1] (resize/crop, stop before Normalize)."""
+    """
+    Map decoded CHW image to raw model input [1,3,480,480] in [0,1].
+
+    PREPROCESS returns a normalized tensor, so invert normalization to recover
+    the resized/cropped raw tensor.
+    """
     x = image_chw.unsqueeze(0).to(device=device, dtype=torch.float32)
-    transforms = getattr(PREPROCESS, "transforms", None)
-    if transforms is None:
-        raise RuntimeError("PREPROCESS has no .transforms; cannot split raw vs normalize pipeline.")
     with torch.no_grad():
-        for transform in transforms:
-            if isinstance(transform, Normalize):
-                break
-            x = transform(x)
-    return x.clamp(0.0, 1.0)
+        x_norm = PREPROCESS(x)
+
+    mean, std = _mean_std_tensors(device=x_norm.device, dtype=x_norm.dtype)
+    x_raw = (x_norm * std + mean).clamp(0.0, 1.0)
+
+    if tuple(x_raw.shape) != EXPECTED_RAW_BASE_SHAPE:
+        raise RuntimeError(
+            f"Unexpected raw base shape {tuple(x_raw.shape)}; expected {EXPECTED_RAW_BASE_SHAPE}"
+        )
+    return x_raw
 
 
-def raw_to_model_input(x_raw: torch.Tensor, delta_raw: torch.Tensor | None = None) -> torch.Tensor:
-    """Apply EfficientNetV2-L normalize from PREPROCESS; delta is in raw [0,1] space."""
-    if _NORM_TRANSFORM is None:
-        raise RuntimeError("EfficientNet normalize transform is unavailable.")
-    x = x_raw if delta_raw is None else (x_raw + delta_raw).clamp(0.0, 1.0)
-    return _NORM_TRANSFORM(x)
+def raw_to_model_input(
+    x_raw: torch.Tensor,
+    delta_raw: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize raw [0,1] image tensor for EfficientNetV2-L: (x - mean) / std."""
+    x = x_raw if delta_raw is None else x_raw + delta_raw
+    x = x.clamp(0.0, 1.0)
+    mean, std = _mean_std_tensors(device=x.device, dtype=x.dtype)
+    return (x - mean) / std
 
 
 def logits_from_raw(
@@ -150,7 +188,7 @@ def verify_feature_map_shape(model: torch.nn.Module, device: torch.device) -> tu
     """Confirm model.features output for 480×480 input is [1, 1280, 15, 15]."""
     model.eval()
     with torch.no_grad():
-        probe = torch.zeros(1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, device=device)
+        probe = raw_to_model_input(torch.zeros(1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, device=device))
         features = model.features(probe)
     shape = tuple(int(dim) for dim in features.shape)
     if shape != EXPECTED_FEATURE_MAP_SHAPE:
@@ -169,10 +207,12 @@ def setup_model(device: torch.device, *, verify_features: bool = True) -> ModelS
     if verify_features:
         feature_shape = verify_feature_map_shape(model=model, device=device)
         logger.info(
-            "setup_model verified feature map shape=%s for input=%sx%s",
+            "setup_model verified feature map shape=%s for input=%sx%s norm_mean=%s norm_std=%s",
             feature_shape,
             MODEL_INPUT_SIZE,
             MODEL_INPUT_SIZE,
+            NORM_MEAN,
+            NORM_STD,
         )
     return ModelSetup(
         model=model,
@@ -196,6 +236,15 @@ def init_attack_state(
     with torch.no_grad():
         logits_batched = logits_from_raw(model=model, x_raw=x_raw_base)
     current_logits = _logits_row(logits_batched).detach().to(dtype=torch.float32)
+
+    pred_idx = int(current_logits.argmax().item())
+    if pred_idx != true_idx:
+        logger.warning(
+            "Provided true_idx=%s does not match clean model prediction=%s",
+            true_idx,
+            pred_idx,
+        )
+
     competitor_idx = best_competitor_idx(current_logits, true_idx)
     gap = competitor_gap(current_logits, true_idx, competitor_idx)
     return AttackState(
