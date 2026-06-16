@@ -29,9 +29,30 @@ FEATURE_CELL_EXPAND_REFINE = 1.5
 PIXEL_STEP_RAW = 1.0 / 255.0
 
 # IMPORTANT:
-# Winner-quality subnet attacks should stay at exactly one uint8 step.
-# Validator winners are commonly norm=0.003922, i.e. 1/255.
-# Do not allow PGD/fallback to use 2/255, 3/255, etc.
+# Winner-quality subnet attacks stay at exactly one uint8 step per channel-pixel.
+# changed_mask ensures each (c,y,x) is touched at most once, so Linf is 0 or 1/255.
+# Values above 1/255 indicate a program-logic bug, not a tunable cap.
+
+
+def _delta_linf(delta: torch.Tensor) -> float:
+    return float(delta.abs().max().item())
+
+
+def _is_one_step_delta(delta: torch.Tensor) -> bool:
+    """True when every changed channel-pixel is exactly ±1/255 and Linf <= 1/255."""
+    peak = _delta_linf(delta)
+    if peak > PIXEL_STEP_RAW + 1e-9:
+        return False
+    if peak <= 1e-12:
+        return True
+    mask = delta.abs() > 1e-12
+    steps = delta[mask].abs()
+    return bool(torch.allclose(steps, torch.full_like(steps, PIXEL_STEP_RAW), atol=1e-9))
+
+
+def _one_step_linf_exceeded(delta: torch.Tensor) -> bool:
+    """Logic error: mask allowed a channel-pixel to exceed one ±1/255 step."""
+    return _delta_linf(delta) > PIXEL_STEP_RAW + 1e-9
 
 # Sparse fallback tries only one-step ±1/255 candidates, never dense multi-step PGD.
 SPARSE_FALLBACK_PREFIX_SIZES = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
@@ -778,8 +799,6 @@ def verify_trial_delta(
     gap_before: float,
     untargeted_gap_before: float,
     num_new_pixels: int,
-    epsilon: float,
-    min_delta: float,
     min_gain_per_pixel: float = DEFAULT_MIN_GAIN_PER_PIXEL,
 ) -> TrialVerification:
     """
@@ -803,9 +822,27 @@ def verify_trial_delta(
     real_gain = float(gap_before - gap_after)
     gain_per_pixel = real_gain / max(int(num_new_pixels), 1)
 
-    max_norm = float(epsilon)
+    if not _is_one_step_delta(delta_try):
+        return TrialVerification(
+            accepted=False,
+            flip_candidate=False,
+            validator_would_pass=False,
+            reason="one_step_linf_exceeded",
+            adv_try=adv_try.detach(),
+            logits=row.detach().to(dtype=torch.float32),
+            pred_idx=pred_idx,
+            norm=norm,
+            rmse=rmse,
+            ssim=ssim,
+            psnr_db=psnr_db,
+            gap_before=gap_before,
+            gap_after=gap_after,
+            real_gain=real_gain,
+            gain_per_pixel=gain_per_pixel,
+        )
+
     value_ok = float(adv_try.min().item()) >= -1e-9 and float(adv_try.max().item()) <= 1.0 + 1e-9
-    norm_ok = norm <= max_norm + 1e-9
+    norm_ok = norm <= PIXEL_STEP_RAW + 1e-9
     untargeted_improved = untargeted_gap_after < untargeted_gap_before - 1e-9
     competitor_gain_ok = (
         real_gain > 0.0 and gain_per_pixel >= float(min_gain_per_pixel)
@@ -830,7 +867,6 @@ def verify_trial_delta(
     flipped = pred_idx != true_idx
     flip_candidate = (
         flipped
-        and norm >= float(min_delta) - 1e-9
         and norm_ok
         and value_ok
         and ssim >= float(MIN_SSIM)
@@ -844,7 +880,7 @@ def verify_trial_delta(
     elif progress_accept:
         reason = "progress_accept"
     elif not norm_ok:
-        reason = "above_max_delta"
+        reason = "one_step_linf_exceeded"
     elif not value_ok:
         reason = "value_out_of_range"
     elif real_gain <= 0.0:
@@ -888,6 +924,8 @@ def commit_verified_delta(
     state.delta = delta_try.detach()
     state.changed_mask = state.delta.abs() > 1e-12
     state.logits = logits.detach().to(dtype=torch.float32)
+    if _one_step_linf_exceeded(state.delta):
+        logger.warning("commit_verified_delta: one-step Linf invariant exceeded (linf=%.6f)", state.linf)
 
 
 def _clamp_grow_batch_size(batch_size: int) -> int:
@@ -907,18 +945,16 @@ def should_accept_region_growth_batch(
     *,
     gap_before: float,
     seed_phase: bool,
-    epsilon: float,
 ) -> tuple[bool, str]:
     """
     Region-growing acceptance (step 13), layered on forward verification metrics.
 
     Seed phase uses step-12 progress/flip gates. Growth phase uses marginal-gain rules.
     """
-    max_norm = float(epsilon)
     value_ok = float(verification.adv_try.min().item()) >= -1e-9 and float(
         verification.adv_try.max().item()
     ) <= 1.0 + 1e-9
-    norm_ok = verification.norm <= max_norm + 1e-9
+    norm_ok = verification.norm <= PIXEL_STEP_RAW + 1e-9
 
     if verification.flip_candidate:
         return True, "flip_candidate"
@@ -931,7 +967,7 @@ def should_accept_region_growth_batch(
     if not value_ok:
         return False, "value_out_of_range"
     if not norm_ok:
-        return False, "above_max_delta"
+        return False, "one_step_linf_exceeded"
 
     strength = classify_region_gain_strength(
         verification.real_gain,
@@ -962,12 +998,9 @@ def select_unused_pixels_in_region(
     )
 
 
-def _region_growth_budget_ok(state: AttackState, batch_len: int, max_delta: float) -> bool:
-    """Batch adds ±1/255 pixels; Linf is max abs delta, not a sum over batch size."""
-    if batch_len <= 0:
-        return False
-    projected_linf = max(state.linf, PIXEL_STEP_RAW)
-    return projected_linf <= float(max_delta) + 1e-9
+def _region_growth_budget_ok(state: AttackState) -> bool:
+    """False only when changed_mask allowed Linf to exceed one ±1/255 step."""
+    return not _one_step_linf_exceeded(state.delta)
 
 
 def try_region_growth_batch(
@@ -980,8 +1013,6 @@ def try_region_growth_batch(
     competitor_idx: int,
     gap_before: float,
     untargeted_gap_before: float,
-    epsilon: float,
-    min_delta: float,
     seed_phase: bool,
     round_id: int,
     log_session: AttackLogSession | None = None,
@@ -1001,14 +1032,11 @@ def try_region_growth_batch(
         gap_before=gap_before,
         untargeted_gap_before=untargeted_gap_before,
         num_new_pixels=len(pixel_changes),
-        epsilon=epsilon,
-        min_delta=min_delta,
     )
     accept, reason = should_accept_region_growth_batch(
         verification,
         gap_before=gap_before,
         seed_phase=seed_phase,
-        epsilon=epsilon,
     )
     if not accept:
         if log_session is not None:
@@ -1061,9 +1089,6 @@ def grow_ranked_region(
     *,
     true_idx: int,
     competitor_idx: int,
-    epsilon: float,
-    min_delta: float,
-    max_delta: float,
     round_id: int = 0,
     deadline: float | None = None,
     max_pixels: int | None = None,
@@ -1105,7 +1130,7 @@ def grow_ranked_region(
             break
 
         pixel_changes = [candidate.as_change() for candidate in candidates[:batch_size]]
-        if not _region_growth_budget_ok(state, len(pixel_changes), max_delta):
+        if not _region_growth_budget_ok(state):
             session.stopped = True
             stopped_reason = "linf_budget"
             break
@@ -1120,8 +1145,6 @@ def grow_ranked_region(
             competitor_idx=competitor_idx,
             gap_before=gap_before,
             untargeted_gap_before=untargeted_gap_before,
-            epsilon=epsilon,
-            min_delta=min_delta,
             seed_phase=seed_phase,
             round_id=round_id,
             log_session=log_session,
@@ -1205,9 +1228,6 @@ def grow_ranked_regions(
     *,
     true_idx: int,
     competitor_idx: int,
-    epsilon: float,
-    min_delta: float,
-    max_delta: float,
     round_id: int = 0,
     deadline: float | None = None,
     max_regions: int = DEFAULT_TOP_REGIONS_PER_COMPETITOR,
@@ -1224,7 +1244,7 @@ def grow_ranked_regions(
     for region in ranked_regions[:max_regions]:
         if deadline is not None and time.monotonic() >= deadline:
             break
-        if state.linf >= float(max_delta) - 1e-9:
+        if _one_step_linf_exceeded(state.delta):
             break
 
         result = grow_ranked_region(
@@ -1234,9 +1254,6 @@ def grow_ranked_regions(
             pixel_grad_raw=pixel_grad_raw,
             true_idx=true_idx,
             competitor_idx=competitor_idx,
-            epsilon=epsilon,
-            min_delta=min_delta,
-            max_delta=max_delta,
             round_id=round_id,
             deadline=deadline,
             max_pixels=max_pixels_per_region,
@@ -1679,23 +1696,14 @@ def build_beam_node(
         expansion_idx=expansion_idx,
     )
 
-def beam_rank_key(
-    node: BeamNode,
-    *,
-    min_delta: float,
-    max_delta: float,
-) -> tuple[float, ...]:
+def beam_rank_key(node: BeamNode) -> tuple[float, ...]:
     """
     Lower is better.
 
-    In strict one-step Linf mode, many successful candidates have the same norm=1/255.
-    Therefore shortest RMSE is mostly controlled by changed pixel-channel count.
+    Successful flips at one-step Linf share norm=1/255, so RMSE is driven mainly
+    by changed pixel-channel count.
     """
-    valid_flip = (
-        node.flipped
-        and node.norm >= float(min_delta) - 1e-9
-        and node.norm <= float(max_delta) + 1e-9
-    )
+    valid_flip = node.flipped and node.changed_pixels > 0 and node.norm <= PIXEL_STEP_RAW + 1e-9
 
     if valid_flip:
         margin = -float(node.untargeted_gap)  # bigger positive margin is safer
@@ -1720,42 +1728,26 @@ def beam_rank_key(
 def _better_flip_node(
     candidate: BeamNode,
     current: BeamNode | None,
-    *,
-    min_delta: float,
-    max_delta: float,
 ) -> bool:
-    if not _is_valid_flip_node(candidate, min_delta=min_delta, max_delta=max_delta):
+    if not _is_valid_flip_node(candidate):
         return False
     if current is None:
         return True
-    return beam_rank_key(candidate, min_delta=min_delta, max_delta=max_delta) < beam_rank_key(
-        current,
-        min_delta=min_delta,
-        max_delta=max_delta,
-    )
-    
+    return beam_rank_key(candidate) < beam_rank_key(current)
 
-def _is_valid_flip_node(node: BeamNode, *, min_delta: float, max_delta: float) -> bool:
-    return (
-        node.flipped
-        and node.norm >= float(min_delta) - 1e-9
-        and node.norm <= float(max_delta) + 1e-9
-    )
+
+def _is_valid_flip_node(node: BeamNode) -> bool:
+    return node.flipped and node.changed_pixels > 0 and node.norm <= PIXEL_STEP_RAW + 1e-9
 
 
 def prune_beam_to_width(
     nodes: list[BeamNode],
     *,
     beam_width: int,
-    min_delta: float,
-    max_delta: float,
 ) -> list[BeamNode]:
     if not nodes:
         return []
-    ranked = sorted(
-        nodes,
-        key=lambda node: beam_rank_key(node, min_delta=min_delta, max_delta=max_delta),
-    )
+    ranked = sorted(nodes, key=beam_rank_key)
     return ranked[: max(1, int(beam_width))]
 
 
@@ -1795,9 +1787,6 @@ def expand_beam_node(
     node: BeamNode,
     *,
     true_idx: int,
-    epsilon: float,
-    min_delta: float,
-    max_delta: float,
     top_k: int,
     top_regions: int,
     round_id: int,
@@ -1875,9 +1864,6 @@ def expand_beam_node(
             pixel_grad_raw=pixel_grad,
             true_idx=true_idx,
             competitor_idx=competitor.idx,
-            epsilon=epsilon,
-            min_delta=min_delta,
-            max_delta=max_delta,
             round_id=round_id,
             deadline=deadline,
             max_pixels=region_grow_max_pixels_per_region,
@@ -1912,8 +1898,6 @@ def run_beam_search_phase(
     clean: torch.Tensor,
     true_idx: int,
     *,
-    epsilon: float,
-    min_delta: float,
     budget: AttackTimeBudget,
     beam_width: int = DEFAULT_BEAM_WIDTH,
     top_k: int = DEFAULT_BEAM_TOP_K,
@@ -1923,8 +1907,6 @@ def run_beam_search_phase(
     region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION,
     log_session: AttackLogSession | None = None,
 ) -> tuple[list[BeamNode], BeamNode | None]:
-    max_delta = float(epsilon)
-    min_delta = float(min_delta)
     initial_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
     beam = [build_beam_node(initial_state)]
     best_flip: BeamNode | None = None
@@ -1953,9 +1935,6 @@ def run_beam_search_phase(
                 model=model,
                 node=node,
                 true_idx=true_idx,
-                epsilon=epsilon,
-                min_delta=min_delta,
-                max_delta=max_delta,
                 top_k=top_k,
                 top_regions=top_regions,
                 round_id=round_idx,
@@ -1967,14 +1946,14 @@ def run_beam_search_phase(
             )
             if child is not None:
                 children.append(child)
-                if _better_flip_node(child, best_flip, min_delta=min_delta, max_delta=max_delta):
+                if _better_flip_node(child, best_flip):
                     best_flip = child
 
         if not children:
             fallback_state = clone_attack_state(
                 min(
                     beam,
-                    key=lambda node: beam_rank_key(node, min_delta=min_delta, max_delta=max_delta),
+                    key=beam_rank_key,
                 ).state
             )
             with torch.no_grad():
@@ -2017,9 +1996,6 @@ def run_beam_search_phase(
                         pixel_grad_raw=pixel_grad,
                         true_idx=true_idx,
                         competitor_idx=active,
-                        epsilon=epsilon,
-                        min_delta=min_delta,
-                        max_delta=max_delta,
                         round_id=round_idx,
                         deadline=budget.search_end,
                         max_pixels_per_region=region_grow_max_pixels_per_region,
@@ -2041,7 +2017,7 @@ def run_beam_search_phase(
                                 recent_gain_per_pixel=last_verify.gain_per_pixel,
                                 round_id=round_idx,
                             )
-                            if _better_flip_node(candidate_flip, best_flip, min_delta=min_delta, max_delta=max_delta):
+                            if _better_flip_node(candidate_flip, best_flip):
                                 best_flip = candidate_flip
             if not children:
                 break
@@ -2049,8 +2025,6 @@ def run_beam_search_phase(
         beam = prune_beam_to_width(
             beam + children,
             beam_width=beam_width,
-            min_delta=min_delta,
-            max_delta=max_delta,
         )
         if log_session is not None:
             log_session.log_beam_round(beam, round_id=round_idx)
@@ -2064,9 +2038,6 @@ def deepen_beam_node(
     node: BeamNode,
     *,
     true_idx: int,
-    epsilon: float,
-    min_delta: float,
-    max_delta: float,
     top_k: int,
     top_regions: int,
     deadline: float | None,
@@ -2118,9 +2089,6 @@ def deepen_beam_node(
         pixel_grad_raw=pixel_grad,
         true_idx=true_idx,
         competitor_idx=active,
-        epsilon=epsilon,
-        min_delta=min_delta,
-        max_delta=max_delta,
         round_id=node.round_id,
         deadline=deadline,
         max_pixels_per_region=region_grow_max_pixels_per_region,
@@ -2193,28 +2161,17 @@ def reverse_pixel_changes(
     return new_delta, new_mask
 
 
-def _removal_breaks_min_delta(
+def _removal_clears_perturbation(
     delta: torch.Tensor,
     pixel_changes: list[PixelChange],
-    *,
-    min_delta: float,
 ) -> bool:
-    """
-    Reject removals that drop Linf below validator min_delta floor.
-
-    IMPORTANT:
-    Existing prune call sites pass only:
-        _removal_breaks_min_delta(state.delta, pixels, min_delta=min_delta)
-
-    So this function must rebuild changed_mask internally.
-    """
+    """True when removing pixels would leave no ±1/255 change (norm → 0)."""
     if not pixel_changes:
         return False
 
     changed_mask = delta.abs() > 1e-12
     trial_delta, _ = reverse_pixel_changes(delta, changed_mask, pixel_changes)
-    new_linf = float(trial_delta.abs().max().item())
-    return new_linf < float(min_delta) - 1e-9
+    return _delta_linf(trial_delta) < PIXEL_STEP_RAW - 1e-9
 
 
 def _collect_pixels_newest_first(accepted_groups: list[AcceptedGroup]) -> list[PixelChange]:
@@ -2276,7 +2233,7 @@ def prune_validator_aware_state(
     A. Remove weakest accepted region groups whole
     B. Remove later-added batches inside each region group
     C. Remove pixel chunks (16 -> 8 -> 4 -> 1), newest first
-    D. Never drop Linf below min_delta
+    D. Never remove the last ±1/255 change while still targeting a flip
     """
     if not state.accepted_groups:
         return state
@@ -2321,7 +2278,7 @@ def prune_validator_aware_state(
                 ]
                 removed_any = True
                 break
-            if _removal_breaks_min_delta(state.delta, pixels_to_remove, min_delta=min_delta):
+            if _removal_clears_perturbation(state.delta, pixels_to_remove):
                 continue
 
             trial_delta, trial_mask = reverse_pixel_changes(
@@ -2368,7 +2325,7 @@ def prune_validator_aware_state(
             batch = batches[-1]
             if batch not in remaining_groups:
                 continue
-            if _removal_breaks_min_delta(state.delta, batch.pixels, min_delta=min_delta):
+            if _removal_clears_perturbation(state.delta, batch.pixels):
                 continue
 
             trial_delta, trial_mask = reverse_pixel_changes(
@@ -2422,7 +2379,7 @@ def prune_validator_aware_state(
             max_start = max(0, len(active_pixels) - chunk_size)
             for start_idx in range(0, max_start + 1, chunk_size):
                 chunk = active_pixels[start_idx : start_idx + chunk_size]
-                if _removal_breaks_min_delta(state.delta, chunk, min_delta=min_delta):
+                if _removal_clears_perturbation(state.delta, chunk):
                     continue
 
                 trial_delta, trial_mask = reverse_pixel_changes(
@@ -2525,7 +2482,6 @@ def prune_beam_candidates(
     beam: list[BeamNode],
     *,
     true_idx: int,
-    epsilon: float,
     top_k: int,
     beam_width: int,
     min_delta: float,
@@ -2550,10 +2506,7 @@ def prune_beam_candidates(
     if not refreshed:
         return beam
 
-    ranked_for_deepen = sorted(
-        refreshed,
-        key=lambda node: beam_rank_key(node, min_delta=min_delta, max_delta=max_delta),
-    )
+    ranked_for_deepen = sorted(refreshed, key=beam_rank_key)
     deepened: list[BeamNode] = []
     for candidate in ranked_for_deepen[: max(1, beam_width)]:
         if time.monotonic() >= budget.prune_end:
@@ -2564,9 +2517,6 @@ def prune_beam_candidates(
                 model=model,
                 node=candidate,
                 true_idx=true_idx,
-                epsilon=epsilon,
-                min_delta=min_delta,
-                max_delta=max_delta,
                 top_k=top_k,
                 top_regions=top_regions,
                 deadline=budget.prune_end,
@@ -2580,7 +2530,7 @@ def prune_beam_candidates(
         if time.monotonic() >= budget.prune_end:
             validator_pruned.append(candidate)
             continue
-        if _is_valid_flip_node(candidate, min_delta=min_delta, max_delta=max_delta):
+        if _is_valid_flip_node(candidate):
             validator_pruned.append(
                 prune_beam_node_validator_aware(
                     model=model,
@@ -2597,14 +2547,14 @@ def prune_beam_candidates(
             validator_pruned.append(candidate)
     refreshed = validator_pruned
 
-    refreshed.sort(key=lambda node: beam_rank_key(node, min_delta=min_delta, max_delta=max_delta))
+    refreshed.sort(key=beam_rank_key)
 
     pruned: list[BeamNode] = []
     for candidate in refreshed:
         dominated = False
         for keeper in pruned:
-            keeper_flip = _is_valid_flip_node(keeper, min_delta=min_delta, max_delta=max_delta)
-            cand_flip = _is_valid_flip_node(candidate, min_delta=min_delta, max_delta=max_delta)
+            keeper_flip = _is_valid_flip_node(keeper)
+            cand_flip = _is_valid_flip_node(candidate)
             if keeper_flip and not cand_flip:
                 dominated = True
                 break
@@ -2626,8 +2576,6 @@ def prune_beam_candidates(
     return prune_beam_to_width(
         pruned,
         beam_width=beam_width,
-        min_delta=min_delta,
-        max_delta=max_delta,
     )
 
 
@@ -2676,8 +2624,7 @@ def enforce_one_step_delta(clean: torch.Tensor, adv: torch.Tensor) -> torch.Tens
 
 
 def one_step_linf_ok(clean: torch.Tensor, adv: torch.Tensor) -> bool:
-    norm = float((adv - clean).abs().max().item())
-    return norm <= PIXEL_STEP_RAW + 1e-9
+    return _is_one_step_delta(adv - clean)
 
 def check_flip_and_gap(
     model: torch.nn.Module,
@@ -2958,26 +2905,17 @@ def roundtrip_pixel_prune(
 def select_best_beam_node(
     beam: list[BeamNode],
     *,
-    min_delta: float,
-    max_delta: float,
     best_flip: BeamNode | None = None,
 ) -> BeamNode | None:
     candidates = list(beam)
 
-    if best_flip is not None and _is_valid_flip_node(
-        best_flip,
-        min_delta=min_delta,
-        max_delta=max_delta,
-    ):
+    if best_flip is not None and _is_valid_flip_node(best_flip):
         candidates.append(best_flip)
 
     if not candidates:
         return None
 
-    return min(
-        candidates,
-        key=lambda node: beam_rank_key(node, min_delta=min_delta, max_delta=max_delta),
-    )
+    return min(candidates, key=beam_rank_key)
 
 
 def pgd_fallback_attack(
@@ -3198,7 +3136,7 @@ def run_feature_guided_attack(
     flip_margin_before_prune = hp.flip_margin_before_prune
 
     max_delta = float(epsilon)
-    min_delta = float(min_delta)
+    validator_min_delta = float(min_delta)
     budget = AttackTimeBudget.from_timeout(
         timeout_seconds,
         search_fraction=hp.search_time_fraction,
@@ -3215,7 +3153,7 @@ def run_feature_guided_attack(
         task_id=task_id,
         true_idx=true_idx,
         true_label=true_label or idx_label(true_idx),
-        min_delta=min_delta,
+        min_delta=validator_min_delta,
         epsilon=float(epsilon),
         effective_max_delta=max_delta,
         timeout_seconds=float(timeout_seconds),
@@ -3238,8 +3176,6 @@ def run_feature_guided_attack(
         model=model,
         clean=clean,
         true_idx=true_idx,
-        epsilon=epsilon,
-        min_delta=min_delta,
         budget=budget,
         beam_width=effective_beam_width,
         top_k=top_k,
@@ -3255,10 +3191,9 @@ def run_feature_guided_attack(
             model=model,
             beam=beam,
             true_idx=true_idx,
-            epsilon=epsilon,
             top_k=top_k,
             beam_width=effective_beam_width,
-            min_delta=min_delta,
+            min_delta=validator_min_delta,
             max_delta=max_delta,
             budget=budget,
             top_regions=top_regions,
@@ -3268,8 +3203,6 @@ def run_feature_guided_attack(
 
     best_node = select_best_beam_node(
         beam,
-        min_delta=min_delta,
-        max_delta=max_delta,
         best_flip=best_flip,
     )
 
@@ -3282,7 +3215,7 @@ def run_feature_guided_attack(
         pre_prune_adv = best_node.adv.clone()
         accepted_groups = list(best_node.state.accepted_groups)
         flip_stats = check_flip_and_gap(model=model, clean=clean, adv=pre_prune_adv, true_idx=true_idx)
-        if _is_valid_flip_node(best_node, min_delta=min_delta, max_delta=max_delta) and _has_flip_margin(
+        if _is_valid_flip_node(best_node) and _has_flip_margin(
             flip_stats,
             margin=flip_margin_before_prune,
         ):
@@ -3290,7 +3223,7 @@ def run_feature_guided_attack(
                 model=model,
                 state=clone_attack_state(best_node.state),
                 true_idx=true_idx,
-                min_delta=min_delta,
+                min_delta=validator_min_delta,
                 max_delta=max_delta,
                 top_k=top_k,
                 deadline=budget.validate_end,
@@ -3308,7 +3241,7 @@ def run_feature_guided_attack(
         clean=clean,
         adv=adv,
         true_idx=true_idx,
-        min_delta=min_delta,
+        min_delta=validator_min_delta,
         max_delta=max_delta,
     ):
         pgd_used = True
@@ -3317,7 +3250,7 @@ def run_feature_guided_attack(
             state=fallback_state,
             true_idx=true_idx,
             max_delta=max_delta,
-            min_delta=min_delta,
+            min_delta=validator_min_delta,
             deadline=budget.hard_end,
             steps=min(10, DEFAULT_STEPS),
         )
