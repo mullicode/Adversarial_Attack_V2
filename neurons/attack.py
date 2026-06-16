@@ -31,6 +31,23 @@ FEATURE_CELL_EXPAND_REFINE = 1.5
 # Validator-visible pixel step in decoded [0, 1] image space.
 PIXEL_STEP_RAW = 1.0 / 255.0
 
+# IMPORTANT:
+# Winner-quality subnet attacks should stay at exactly one uint8 step.
+# Validator winners are commonly norm=0.003922, i.e. 1/255.
+# Do not allow PGD/fallback to use 2/255, 3/255, etc.
+STRICT_ONE_STEP_LINF = os.getenv("PERTURB_STRICT_ONE_STEP_LINF", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+ONE_STEP_LINF_TOL = 1e-7
+MAX_STRICT_LINF = PIXEL_STEP_RAW + ONE_STEP_LINF_TOL
+
+# Sparse fallback tries only one-step ±1/255 candidates, never dense multi-step PGD.
+SPARSE_FALLBACK_PREFIX_SIZES = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+SPARSE_FALLBACK_MAX_CANDIDATES = int(os.getenv("PERTURB_SPARSE_FALLBACK_MAX_CANDIDATES", "20000"))
+
 # Untargeted top-K competitor race.
 TOP_K_FAST = 5
 TOP_K_STARTING = 8
@@ -476,7 +493,16 @@ def is_prediction_flipped(model: torch.nn.Module, image_chw: torch.Tensor, true_
 
 
 def _effective_max_delta(epsilon: float) -> float:
-    return min(float(epsilon), float(MAX_LINF_DELTA))
+    """
+    Effective Linf limit used by the miner attack engine.
+
+    For score quality, keep attack at one raw uint8 step when STRICT_ONE_STEP_LINF is on.
+    This prevents fallback from producing 2/255, 3/255, etc.
+    """
+    base = min(float(epsilon), float(MAX_LINF_DELTA))
+    if STRICT_ONE_STEP_LINF:
+        return min(base, float(MAX_STRICT_LINF))
+    return base
 
 
 def compute_top_k_competitors(
@@ -3118,6 +3144,26 @@ def candidate_stats(clean: torch.Tensor, adv: torch.Tensor) -> CandidateStats:
     rmse = _compute_path_rmse(clean, adv)
     return CandidateStats(norm=norm, rmse=rmse)
 
+def enforce_one_step_delta(clean: torch.Tensor, adv: torch.Tensor) -> torch.Tensor:
+    """
+    Convert any candidate adv into strict {-1/255, 0, +1/255} delta.
+
+    This is a safety guard before PNG roundtrip / final return.
+    It prevents accumulated floating-point or PGD-style deltas from becoming 2/255+.
+    """
+    diff = (adv.detach() - clean.detach()).to(dtype=clean.dtype)
+    delta = torch.zeros_like(diff)
+
+    half_step = PIXEL_STEP_RAW * 0.5
+    delta[diff > half_step] = PIXEL_STEP_RAW
+    delta[diff < -half_step] = -PIXEL_STEP_RAW
+
+    return (clean + delta).clamp(0.0, 1.0)
+
+
+def one_step_linf_ok(clean: torch.Tensor, adv: torch.Tensor) -> bool:
+    norm = float((adv - clean).abs().max().item())
+    return norm <= float(MAX_STRICT_LINF) + 1e-9
 
 def check_flip_and_gap(
     model: torch.nn.Module,
@@ -3229,12 +3275,15 @@ def png_roundtrip_verify(
     """
     PNG encode/decode roundtrip using perturbnet.image_io helpers.
 
-    encoded = encode_image_b64(adv)
-    decoded = decode_image_b64(encoded)
-
-    Re-runs predict_index and norm/rmse on decoded pixels. If roundtrip loses flip,
-    tries restore candidates (pre-prune adv, highest-gain batches, then original adv).
+    In strict one-step mode:
+        - first quantize candidate to {-1/255, 0, +1/255}
+        - encode PNG
+        - decode PNG
+        - validate decoded tensor
+        - return decoded tensor, because that is what validator sees
     """
+    strict_max_delta = min(float(max_delta), float(MAX_STRICT_LINF)) if STRICT_ONE_STEP_LINF else float(max_delta)
+
     trial_adv_list = _roundtrip_restore_candidates(
         clean=clean,
         adv=adv,
@@ -3242,49 +3291,85 @@ def png_roundtrip_verify(
         restore_adv_candidates=restore_adv_candidates,
     )
 
+    last_encoded = ""
+    last_decoded: torch.Tensor | None = None
+    last_pred_idx = true_idx
+    last_stats = CandidateStats(norm=0.0, rmse=0.0)
+    last_reason = "no_candidate"
+
     for index, trial_adv in enumerate(trial_adv_list):
+        if STRICT_ONE_STEP_LINF:
+            trial_adv = enforce_one_step_delta(clean, trial_adv)
+
         encoded = encode_image_b64(trial_adv)
         decoded = decode_image_b64(encoded).to(device=clean.device)
+
         stats = candidate_stats(clean, decoded)
         pred_idx = inference_predict_index(model=model, image_chw=decoded)
 
-        if _roundtrip_decoded_passes(
-            model=model,
-            clean=clean,
-            decoded=decoded,
-            true_idx=true_idx,
-            min_delta=min_delta,
-            max_delta=max_delta,
-        ):
-            return PngRoundtripResult(
-                final_adv=decoded.clamp(0.0, 1.0),
-                encoded_b64=encoded,
-                decoded_adv=decoded,
-                pred_idx=pred_idx,
-                norm=stats.norm,
-                rmse=stats.rmse,
-                passed=True,
-                restored_from_backup=index > 0,
-                reason="roundtrip_ok" if index == 0 else "restored_backup",
-            )
+        last_encoded = encoded
+        last_decoded = decoded
+        last_pred_idx = pred_idx
+        last_stats = stats
 
-    fallback = adv.detach().clamp(0.0, 1.0)
-    encoded = encode_image_b64(fallback)
-    decoded = decode_image_b64(encoded).to(device=clean.device)
-    stats = candidate_stats(clean, decoded)
-    pred_idx = inference_predict_index(model=model, image_chw=decoded)
+        if decoded.shape != clean.shape:
+            last_reason = "shape_mismatch"
+            continue
+
+        if pred_idx == true_idx:
+            last_reason = "roundtrip_not_flipped"
+            continue
+
+        if stats.norm < float(min_delta) - 1e-9:
+            last_reason = "below_min_delta"
+            continue
+
+        if stats.norm > strict_max_delta + 1e-9:
+            last_reason = "above_one_step_linf" if STRICT_ONE_STEP_LINF else "above_max_delta"
+            continue
+
+        ssim = compute_ssim(clean, decoded)
+        psnr_db = compute_psnr_db(clean, decoded)
+        if ssim < float(MIN_SSIM):
+            last_reason = "below_min_ssim"
+            continue
+        if psnr_db < float(MIN_PSNR_DB):
+            last_reason = "below_min_psnr"
+            continue
+
+        return PngRoundtripResult(
+            final_adv=decoded.detach().clamp(0.0, 1.0),
+            encoded_b64=encoded,
+            decoded_adv=decoded.detach().clamp(0.0, 1.0),
+            pred_idx=pred_idx,
+            norm=stats.norm,
+            rmse=stats.rmse,
+            passed=True,
+            restored_from_backup=index > 0,
+            reason="roundtrip_ok" if index == 0 else "restored_backup",
+        )
+
+    # Return decoded last candidate, not the pre-encoded float tensor.
+    if last_decoded is None:
+        fallback = enforce_one_step_delta(clean, adv) if STRICT_ONE_STEP_LINF else adv.detach().clamp(0.0, 1.0)
+        last_encoded = encode_image_b64(fallback)
+        last_decoded = decode_image_b64(last_encoded).to(device=clean.device)
+        last_stats = candidate_stats(clean, last_decoded)
+        last_pred_idx = inference_predict_index(model=model, image_chw=last_decoded)
+        last_reason = "roundtrip_failed"
+
     return PngRoundtripResult(
-        final_adv=fallback,
-        encoded_b64=encoded,
-        decoded_adv=decoded,
-        pred_idx=pred_idx,
-        norm=stats.norm,
-        rmse=stats.rmse,
+        final_adv=last_decoded.detach().clamp(0.0, 1.0),
+        encoded_b64=last_encoded,
+        decoded_adv=last_decoded.detach().clamp(0.0, 1.0),
+        pred_idx=last_pred_idx,
+        norm=last_stats.norm,
+        rmse=last_stats.rmse,
         passed=False,
         restored_from_backup=False,
-        reason="roundtrip_flip_lost",
+        reason=last_reason,
     )
-
+    
 
 def final_validate_roundtrip(
     model: torch.nn.Module,
@@ -3363,31 +3448,171 @@ def _pgd_fallback_attack(
     deadline: float,
     steps: int = 10,
 ) -> torch.Tensor:
-    adv = state.adv.clone()
+    """
+    Sparse one-step fallback.
+
+    This replaces dense multi-step PGD.
+    It never applies more than ±1/255 to any decoded raw pixel-channel.
+
+    Goal:
+        Try to find a flip with norm ≈ 1/255 and as few extra pixels as possible.
+
+    If it cannot flip, return the current state.adv instead of sending a dense 3/255 result.
+    """
+    del steps
+
+    # Hard cap fallback to one-step Linf.
+    max_delta = min(float(max_delta), float(MAX_STRICT_LINF)) if STRICT_ONE_STEP_LINF else float(max_delta)
+
+    base_adv = enforce_one_step_delta(state.clean, state.adv) if STRICT_ONE_STEP_LINF else state.adv.detach().clone()
+    base_delta = (base_adv - state.clean).detach()
+
+    # If current sparse state already flips under one-step rule, keep it.
+    if validator_passes_adv(
+        model=model,
+        clean=state.clean,
+        adv=base_adv,
+        true_idx=true_idx,
+        min_delta=min_delta,
+        max_delta=max_delta,
+    ):
+        state.delta = base_delta
+        state.changed_mask = state.delta.abs() > 1e-12
+        refresh_state_logits(model=model, state=state, top_k=DEFAULT_TOP_K)
+        return state.adv
+
+    if time.monotonic() >= deadline:
+        return base_adv
+
+    # Compute untargeted CE gradient from current one-step sparse state.
     true_tensor = torch.tensor([true_idx], device=state.clean.device)
-    fallback_step = max(max_delta / 4.0, PIXEL_STEP_RAW)
-    for _ in range(steps):
+    adv_raw = base_adv.detach().clone().requires_grad_(True)
+
+    logits, _ = forward_logits_features(model=model, image_bchw=adv_raw.unsqueeze(0))
+    loss = F.cross_entropy(logits, true_tensor)
+
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+
+    grad = adv_raw.grad
+    if grad is None or float(grad.abs().max().item()) <= 0.0:
+        return base_adv
+
+    # Candidate direction for untargeted CE fallback:
+    # increase CE loss, so move with sign(grad), but only one raw step.
+    clean = state.clean
+    current_changed = base_delta.abs() > 1e-12
+
+    flat_grad = grad.detach().abs().reshape(-1)
+    total = int(flat_grad.numel())
+    top_n = min(int(SPARSE_FALLBACK_MAX_CANDIDATES), total)
+
+    values, indices = torch.topk(flat_grad, k=top_n, largest=True)
+
+    candidate_changes: list[PixelChange] = []
+    _, height, width = clean.shape
+
+    for flat_idx in indices.tolist():
         if time.monotonic() >= deadline:
             break
-        adv_raw = adv.detach().clone().requires_grad_(True)
-        logits, _ = forward_logits_features(model=model, image_bchw=adv_raw.unsqueeze(0))
-        loss = F.cross_entropy(logits, true_tensor)
-        model.zero_grad(set_to_none=True)
-        loss.backward()
-        grad = adv_raw.grad
-        if grad is None:
+
+        c = int(flat_idx // (height * width))
+        rem = int(flat_idx % (height * width))
+        y = int(rem // width)
+        x = int(rem % width)
+
+        if current_changed[c, y, x]:
+            continue
+
+        g = float(grad[c, y, x].item())
+        if g == 0.0:
+            continue
+
+        direction = 1 if g > 0.0 else -1
+        next_raw = float(clean[c, y, x].item()) + float(direction) * PIXEL_STEP_RAW
+
+        # Reject clipping-invalid one-step changes.
+        if next_raw < -1e-9 or next_raw > 1.0 + 1e-9:
+            continue
+
+        candidate_changes.append(PixelChange(channel=c, y=y, x=x, direction=direction))
+
+    if not candidate_changes:
+        return base_adv
+
+    # Try increasing sparse prefixes, then binary search the first flipping prefix.
+    best_adv = base_adv
+    best_rmse = float("inf")
+
+    def _build_adv(prefix_len: int) -> torch.Tensor:
+        delta_try = base_delta.clone()
+        for change in candidate_changes[:prefix_len]:
+            delta_try[change.channel, change.y, change.x] = float(change.direction) * PIXEL_STEP_RAW
+        return (clean + delta_try).clamp(0.0, 1.0)
+
+    for prefix_size in SPARSE_FALLBACK_PREFIX_SIZES:
+        if time.monotonic() >= deadline:
             break
-        adv = adv.detach() + fallback_step * grad.sign()
-        adv = torch.max(
-            torch.min(adv, state.clean + max_delta),
-            state.clean - max_delta,
-        ).clamp(0.0, 1.0)
-        state.delta = (adv - state.clean).detach()
+
+        prefix_size = min(int(prefix_size), len(candidate_changes))
+        if prefix_size <= 0:
+            continue
+
+        trial_adv = _build_adv(prefix_size)
+
+        if not one_step_linf_ok(clean, trial_adv):
+            continue
+
+        if validator_passes_adv(
+            model=model,
+            clean=clean,
+            adv=trial_adv,
+            true_idx=true_idx,
+            min_delta=min_delta,
+            max_delta=max_delta,
+        ):
+            # Binary search minimal prefix that still flips.
+            lo, hi = 1, prefix_size
+            while lo < hi and time.monotonic() < deadline:
+                mid = (lo + hi) // 2
+                mid_adv = _build_adv(mid)
+
+                if validator_passes_adv(
+                    model=model,
+                    clean=clean,
+                    adv=mid_adv,
+                    true_idx=true_idx,
+                    min_delta=min_delta,
+                    max_delta=max_delta,
+                ):
+                    hi = mid
+                else:
+                    lo = mid + 1
+
+            final_adv = _build_adv(hi)
+            stats = candidate_stats(clean, final_adv)
+            if stats.rmse < best_rmse:
+                best_adv = final_adv
+                best_rmse = stats.rmse
+            break
+
+    # Commit only if fallback found a valid one-step flip.
+    if validator_passes_adv(
+        model=model,
+        clean=clean,
+        adv=best_adv,
+        true_idx=true_idx,
+        min_delta=min_delta,
+        max_delta=max_delta,
+    ):
+        state.delta = (best_adv - clean).detach()
+        state.changed_mask = state.delta.abs() > 1e-12
         refresh_state_logits(model=model, state=state, top_k=DEFAULT_TOP_K)
-        race = compute_top_k_competitors(logits=state.logits.unsqueeze(0), true_idx=true_idx, k=1)
-        if race.is_success(state.logits.unsqueeze(0)) and state.linf >= min_delta:
-            return state.adv
-    return adv
+        return state.adv
+
+    # Do NOT return dense/multi-step fallback.
+    # Return previous sparse state, even if it did not flip.
+    return base_adv
 
 
 def run_feature_guided_attack(

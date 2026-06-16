@@ -196,7 +196,20 @@ class PerturbMiner:
         epsilon = float(synapse.epsilon)
         min_delta = float(getattr(synapse, "min_delta", 0.002))
         timeout_seconds = float(getattr(synapse, "timeout_seconds", 60))
-        effective_max = min(epsilon, float(MAX_LINF_DELTA))
+        # Winner-quality mode: force attack Linf to one raw uint8 step.
+        # 1/255 = 0.0039215686, matching high-score validator logs.
+        strict_one_step = os.getenv("PERTURB_STRICT_ONE_STEP_LINF", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        one_step_max = (1.0 / 255.0) + 1e-7
+
+        if strict_one_step:
+            effective_max = min(epsilon, float(MAX_LINF_DELTA), one_step_max)
+        else:
+            effective_max = min(epsilon, float(MAX_LINF_DELTA))
         deadline = time.monotonic() + timeout_seconds
         attack_hyperparams = resolve_attack_hyperparams(os.getenv("PERTURB_ATTACK_PRESET"))
         task_id = str(getattr(synapse, "task_id", "unknown"))
