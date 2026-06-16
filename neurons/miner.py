@@ -66,20 +66,41 @@ def _make_subtensor(config):
         return subtensor_cls(config=config)
 
 
-def _make_axon(wallet, config):
-    resolved_config = config() if callable(config) else config
-    if hasattr(bt, "axon"):
-        try:
-            return bt.axon(wallet=wallet, config=resolved_config)
-        except Exception:
-            return bt.axon(wallet=wallet)
+def _make_axon(wallet, config) -> typing.Any:
+    axon_cfg = getattr(config, "axon", None)
+    port = int(
+        getattr(axon_cfg, "port", None)
+        or getattr(config, "axon_port", None)
+        or os.getenv("MINER_PORT", os.getenv("AXON_PORT", "9000"))
+    )
+    ip = str(
+        getattr(axon_cfg, "ip", None) or os.getenv("MINER_IP", os.getenv("AXON_IP", "0.0.0.0"))
+    ).strip() or "0.0.0.0"
+    external_ip = str(
+        getattr(axon_cfg, "external_ip", None) or os.getenv("MINER_EXTERNAL_IP", "")
+    ).strip()
+    external_port_raw = (
+        getattr(axon_cfg, "external_port", None) or os.getenv("MINER_EXTERNAL_PORT", "")
+    )
+    external_port = int(str(external_port_raw).strip()) if str(external_port_raw).strip() else port
+    if not external_ip:
+        raise RuntimeError(
+            "MINER_EXTERNAL_IP is not set. "
+            "Set it to the public IP address that validators can reach this miner on."
+        )
+    max_workers = int(getattr(axon_cfg, "max_workers", None) or os.getenv("AXON_MAX_WORKERS", "10"))
     axon_cls = getattr(bt, "Axon", None)
     if axon_cls is None:
-        raise RuntimeError("No axon constructor found in bittensor.")
-    try:
-        return axon_cls(wallet=wallet, config=resolved_config)
-    except Exception:
-        return axon_cls(wallet=wallet)
+        raise RuntimeError("bittensor.Axon class not found.")
+    logger.info(
+        f"[MINER] Creating axon ip={ip} port={port} "
+        f"external_ip={external_ip} external_port={external_port} max_workers={max_workers}"
+    )
+    return axon_cls(
+        wallet=wallet, ip=ip, port=port,
+        external_ip=external_ip, external_port=external_port,
+        max_workers=max_workers,
+    )
 
 
 def _configure_log_level(level_raw: str) -> None:
