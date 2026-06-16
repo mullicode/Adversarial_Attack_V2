@@ -468,16 +468,6 @@ def inference_predict_label(model: torch.nn.Module, image_chw: torch.Tensor) -> 
     return predict_label(model=model, image_chw=image_chw)
 
 
-def _effective_max_delta(epsilon: float) -> float:
-    """Linf cap passed from the miner (already clamped to subnet policy)."""
-    return float(epsilon)
-
-
-def _uses_one_step_linf_cap(max_delta: float) -> bool:
-    """True when the miner capped Linf to a single ±1/255 step."""
-    return float(max_delta) <= PIXEL_STEP_RAW + 1e-9
-
-
 def compute_top_k_competitors(
     logits: torch.Tensor,
     true_idx: int,
@@ -813,7 +803,7 @@ def verify_trial_delta(
     real_gain = float(gap_before - gap_after)
     gain_per_pixel = real_gain / max(int(num_new_pixels), 1)
 
-    max_norm = _effective_max_delta(epsilon)
+    max_norm = float(epsilon)
     value_ok = float(adv_try.min().item()) >= -1e-9 and float(adv_try.max().item()) <= 1.0 + 1e-9
     norm_ok = norm <= max_norm + 1e-9
     untargeted_improved = untargeted_gap_after < untargeted_gap_before - 1e-9
@@ -924,7 +914,7 @@ def should_accept_region_growth_batch(
 
     Seed phase uses step-12 progress/flip gates. Growth phase uses marginal-gain rules.
     """
-    max_norm = _effective_max_delta(epsilon)
+    max_norm = float(epsilon)
     value_ok = float(verification.adv_try.min().item()) >= -1e-9 and float(
         verification.adv_try.max().item()
     ) <= 1.0 + 1e-9
@@ -1933,7 +1923,7 @@ def run_beam_search_phase(
     region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION,
     log_session: AttackLogSession | None = None,
 ) -> tuple[list[BeamNode], BeamNode | None]:
-    max_delta = _effective_max_delta(epsilon)
+    max_delta = float(epsilon)
     min_delta = float(min_delta)
     initial_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
     beam = [build_beam_node(initial_state)]
@@ -2788,9 +2778,6 @@ def png_roundtrip_verify(
     Instead of returning the first passing candidate, test all candidate sources
     and return the lowest-RMSE validator-passing decoded tensor.
     """
-    strict_max_delta = float(max_delta)
-    one_step_cap = _uses_one_step_linf_cap(max_delta)
-
     trial_adv_list = _roundtrip_restore_candidates(
         clean=clean,
         adv=adv,
@@ -2807,8 +2794,7 @@ def png_roundtrip_verify(
     last_reason = "no_candidate"
 
     for index, trial_adv in enumerate(trial_adv_list):
-        if one_step_cap:
-            trial_adv = enforce_one_step_delta(clean, trial_adv)
+        trial_adv = enforce_one_step_delta(clean, trial_adv)
 
         encoded = encode_image_b64(trial_adv)
         decoded = decode_image_b64(encoded).to(device=clean.device)
@@ -2833,8 +2819,8 @@ def png_roundtrip_verify(
             last_reason = "below_min_delta"
             continue
 
-        if stats.norm > strict_max_delta + 1e-9:
-            last_reason = "above_one_step_linf" if one_step_cap else "above_max_delta"
+        if stats.norm > float(max_delta) + 1e-9:
+            last_reason = "above_max_delta"
             continue
 
         ssim = compute_ssim(clean, decoded)
@@ -2865,7 +2851,7 @@ def png_roundtrip_verify(
         return best_result
 
     if last_decoded is None:
-        fallback = enforce_one_step_delta(clean, adv) if one_step_cap else adv.detach().clamp(0.0, 1.0)
+        fallback = enforce_one_step_delta(clean, adv)
         last_encoded = encode_image_b64(fallback)
         last_decoded = decode_image_b64(last_encoded).to(device=clean.device)
         last_stats = candidate_stats(clean, last_decoded)
@@ -2944,8 +2930,7 @@ def roundtrip_pixel_prune(
                 for c, y, x in chunk.tolist():
                     trial[int(c), int(y), int(x)] = clean[int(c), int(y), int(x)]
 
-                if _uses_one_step_linf_cap(max_delta):
-                    trial = enforce_one_step_delta(clean, trial)
+                trial = enforce_one_step_delta(clean, trial)
 
                 encoded = encode_image_b64(trial)
                 decoded = decode_image_b64(encoded).to(device=clean.device)
@@ -3039,10 +3024,8 @@ def _pgd_fallback_attack(
     """
     del steps
 
-    one_step_cap = _uses_one_step_linf_cap(max_delta)
     max_delta = float(max_delta)
-
-    base_adv = enforce_one_step_delta(state.clean, state.adv) if one_step_cap else state.adv.detach().clone()
+    base_adv = enforce_one_step_delta(state.clean, state.adv)
     base_delta = (base_adv - state.clean).detach()
 
     # If current sparse state already flips under one-step rule, keep it.
@@ -3214,7 +3197,7 @@ def run_feature_guided_attack(
     top_regions = hp.top_regions_per_competitor
     flip_margin_before_prune = hp.flip_margin_before_prune
 
-    max_delta = _effective_max_delta(epsilon)
+    max_delta = float(epsilon)
     min_delta = float(min_delta)
     budget = AttackTimeBudget.from_timeout(
         timeout_seconds,
