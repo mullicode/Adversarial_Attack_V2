@@ -327,7 +327,7 @@ class TrialVerification:
     validator_would_pass: bool
     reason: str
     adv_try: torch.Tensor
-    logits: torch.Tensor
+    logits: torch.Tensor  # [num_classes] 1-D row from _inference_logits_row
     pred_idx: int
     norm: float
     rmse: float
@@ -468,10 +468,16 @@ class AttackState:
 
 
 def _logits_row(logits: torch.Tensor) -> torch.Tensor:
-    """Strip a leading batch dim from model output [1, num_classes] -> [num_classes]."""
-    if logits.ndim == 2:
+    """
+    Normalize logits to a 1-D [num_classes] row.
+
+    Model forward returns [1, num_classes]; AttackState.logits is already 1-D.
+    """
+    if logits.ndim == 1:
+        return logits
+    if logits.ndim == 2 and logits.shape[0] == 1:
         return logits[0]
-    return logits
+    raise ValueError(f"Expected logits [num_classes] or [1, num_classes], got {tuple(logits.shape)}")
 
 
 def inference_logits(model: torch.nn.Module, image_chw: torch.Tensor) -> torch.Tensor:
@@ -505,10 +511,14 @@ def compute_top_k_competitors(
     """
     Rank top-K non-true classes by logit for dynamic untargeted competitor race.
 
-    ``logits_row`` is a single 1-D vector [num_classes] (same layout as AttackState.logits).
+    ``logits_row`` must be 1-D with shape [num_classes] (same as AttackState.logits).
     gap_k = logit_true - logit_competitor (positive while true class still leads).
     """
-    row = logits_row.detach().float().reshape(-1)
+    if logits_row.ndim != 1:
+        raise ValueError(
+            f"logits_row must be 1-D [num_classes], got shape {tuple(logits_row.shape)}"
+        )
+    row = logits_row.detach().float()
     true_logit = float(row[true_idx].item())
 
     masked = row.clone()
@@ -542,11 +552,12 @@ def refresh_competitor_race(state: AttackState, k: int) -> TopKCompetitorRace:
 
 
 def competitor_gap(logits_row: torch.Tensor, true_idx: int, competitor_idx: int) -> float:
+    """``logits_row``: 1-D [num_classes]."""
     return float((logits_row[true_idx] - logits_row[competitor_idx]).item())
 
 
 def untargeted_gap(logits_row: torch.Tensor, true_idx: int) -> float:
-    """logit_true - max(logit_other); equivalent to the easiest top-1 competitor gap."""
+    """logit_true - max(logit_other); ``logits_row`` is 1-D [num_classes]."""
     masked = logits_row.clone()
     masked[true_idx] = float("-inf")
     return float((logits_row[true_idx] - masked.max()).item())
@@ -923,8 +934,13 @@ def commit_verified_delta(
     delta_try: torch.Tensor,
     logits: torch.Tensor,
 ) -> None:
+    """``logits`` is the 1-D row stored on TrialVerification (already from _inference_logits_row)."""
     state.delta = delta_try.detach()
     state.changed_mask = state.delta.abs() > 1e-12
+    if logits.ndim != 1:
+        raise ValueError(
+            f"commit_verified_delta expects 1-D logits [num_classes], got {tuple(logits.shape)}"
+        )
     state.logits = logits.detach().to(dtype=torch.float32)
     if _one_step_linf_exceeded(state.delta):
         logger.warning("commit_verified_delta: one-step Linf invariant exceeded (linf=%.6f)", state.linf)
