@@ -19,13 +19,11 @@ logger = logging.getLogger(__name__)
 
 FEATURE_MAP_SIZE = 15
 MODEL_CROP_SIZE = 480
-EXPECTED_FEATURE_MAP_SHAPE = (1, 1280, FEATURE_MAP_SIZE, FEATURE_MAP_SIZE)
 SPARSE_PIXEL_FRACTION = 0.05
 DEFAULT_STEPS = 40
 
 # Feature-cell box expansion in 480×480 crop space (one cell ≈ 32×32 px).
 FEATURE_CELL_EXPAND_FIRST = 2.0
-FEATURE_CELL_EXPAND_WIDE = 3.0
 FEATURE_CELL_EXPAND_REFINE = 1.5
 
 # Validator-visible pixel step in decoded [0, 1] image space.
@@ -51,7 +49,6 @@ SPARSE_FALLBACK_MAX_CANDIDATES = int(os.getenv("PERTURB_SPARSE_FALLBACK_MAX_CAND
 # Untargeted top-K competitor race.
 TOP_K_FAST = 5
 TOP_K_STARTING = 8
-TOP_K_BALANCED = 10
 TOP_K_STRONG = 20
 DEFAULT_TOP_K = TOP_K_STRONG
 
