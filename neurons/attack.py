@@ -444,6 +444,13 @@ class BeamNode:
 
 @dataclass
 class AttackState:
+    """
+    Sparse attack path state.
+
+    Stored fields: clean, delta, changed_mask, true_idx, logits, competitor tracking.
+    Computed: ``adv`` (= clamp(clean + delta)), ``adv_raw``, ``linf``.
+    """
+
     clean: torch.Tensor  # [3, H, W] decoded challenge image in [0, 1]
     delta: torch.Tensor  # [3, H, W] sparse perturbation, typically {-1/255, 0, +1/255}
     changed_mask: torch.Tensor  # [3, H, W] bool — each channel-pixel changed at most once
@@ -455,6 +462,7 @@ class AttackState:
 
     @property
     def adv(self) -> torch.Tensor:
+        """Validator-visible adversarial image: clamp(clean + delta, 0, 1)."""
         return (self.clean + self.delta).clamp(0.0, 1.0)
 
     @property
@@ -1917,6 +1925,7 @@ def run_beam_search_phase(
     true_idx: int,
     *,
     budget: AttackTimeBudget,
+    initial_state: AttackState | None = None,
     beam_width: int = DEFAULT_BEAM_WIDTH,
     top_k: int = DEFAULT_BEAM_TOP_K,
     top_regions: int = DEFAULT_BEAM_TOP_REGIONS,
@@ -1925,12 +1934,13 @@ def run_beam_search_phase(
     region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION,
     log_session: AttackLogSession | None = None,
 ) -> tuple[list[BeamNode], BeamNode | None]:
-    initial_state = init_attack_state(
-        model=model,
-        clean=clean,
-        true_idx=true_idx,
-        top_k=top_k,
-    )
+    if initial_state is None:
+        initial_state = init_attack_state(
+            model=model,
+            clean=clean,
+            true_idx=true_idx,
+            top_k=top_k,
+        )
     beam = [build_beam_node(initial_state)]
     best_flip: BeamNode | None = None
 
@@ -3207,6 +3217,7 @@ def run_feature_guided_attack(
         clean=clean,
         true_idx=true_idx,
         budget=budget,
+        initial_state=initial_state,
         beam_width=effective_beam_width,
         top_k=top_k,
         top_regions=top_regions,
