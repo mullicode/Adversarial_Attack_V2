@@ -358,14 +358,6 @@ class PerturbValidator:
         root_logger.removeHandler(self._wandb_console_handler)
         self._wandb_console_handler = None
 
-    def _wandb_log(self, payload: dict[str, Any]) -> None:
-        if self.wandb_run is None:
-            return
-        try:
-            self.wandb_run.log(payload, step=int(self.step))
-        except Exception as exc:
-            logger.warning(f"W&B log failed: {exc}")
-
     def _finish_wandb(self) -> None:
         self._detach_wandb_console_handler()
         if self.wandb_run is None:

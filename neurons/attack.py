@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
-from perturbnet.constants import MAX_LINF_DELTA, MIN_LINF_DELTA, MIN_PSNR_DB, MIN_SSIM, TIMEOUT_SECONDS
+from perturbnet.constants import MAX_LINF_DELTA, MIN_PSNR_DB, MIN_SSIM, TIMEOUT_SECONDS
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import forward_logits_features, logits_for_images, predict_index, predict_label
 
@@ -470,14 +470,6 @@ def inference_logits(model: torch.nn.Module, image_chw: torch.Tensor) -> torch.T
     return logits_for_images(model=model, image_bchw=image_chw.unsqueeze(0))
 
 
-def inference_logits_features(
-    model: torch.nn.Module,
-    image_chw: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Logits and final feature map A for decoded CHW image (includes PREPROCESS)."""
-    return forward_logits_features(model=model, image_bchw=image_chw.unsqueeze(0))
-
-
 def inference_predict_index(model: torch.nn.Module, image_chw: torch.Tensor) -> int:
     """Canonical class index via perturbnet.model (includes PREPROCESS)."""
     return predict_index(model=model, image_chw=image_chw)
@@ -486,10 +478,6 @@ def inference_predict_index(model: torch.nn.Module, image_chw: torch.Tensor) -> 
 def inference_predict_label(model: torch.nn.Module, image_chw: torch.Tensor) -> str:
     """Canonical label string via perturbnet.model (includes PREPROCESS)."""
     return predict_label(model=model, image_chw=image_chw)
-
-
-def is_prediction_flipped(model: torch.nn.Module, image_chw: torch.Tensor, true_idx: int) -> bool:
-    return inference_predict_index(model=model, image_chw=image_chw) != true_idx
 
 
 def _effective_max_delta(epsilon: float) -> float:
@@ -548,13 +536,6 @@ def refresh_competitor_race(state: AttackState, k: int = DEFAULT_TOP_K) -> TopKC
     return race
 
 
-def best_competitor_idx(logits: torch.Tensor, true_idx: int) -> int:
-    race = compute_top_k_competitors(logits=logits, true_idx=true_idx, k=1)
-    if not race.competitors:
-        return true_idx
-    return race.competitors[0].idx
-
-
 def competitor_gap(logits: torch.Tensor, true_idx: int, competitor_idx: int) -> float:
     row = _logits_row(logits)
     return float((row[true_idx] - row[competitor_idx]).item())
@@ -565,11 +546,6 @@ def untargeted_gap(logits: torch.Tensor, true_idx: int) -> float:
     if not race.competitors:
         return 0.0
     return race.competitors[0].gap_k
-
-
-def is_flip_success(logits: torch.Tensor, true_idx: int) -> bool:
-    race = compute_top_k_competitors(logits=logits, true_idx=true_idx, k=1)
-    return race.is_success(logits)
 
 
 def init_attack_state(
@@ -673,17 +649,6 @@ def can_apply_pixel_change(state: AttackState, change: PixelChange) -> bool:
     return True
 
 
-def apply_pixel_change(state: AttackState, change: PixelChange) -> bool:
-    if not can_apply_pixel_change(state, change):
-        return False
-
-    step = float(change.direction) * PIXEL_STEP_RAW
-    c, y, x = change.channel, change.y, change.x
-    state.delta[c, y, x] = state.delta[c, y, x] + step
-    state.changed_mask[c, y, x] = True
-    return True
-
-
 def propose_pixel_candidate(
     state: AttackState,
     pixel_grad_raw: torch.Tensor,
@@ -751,28 +716,6 @@ def select_pixels_in_region(
     if top_n is None or top_n <= 0:
         return candidates
     return candidates[:top_n]
-
-
-def select_pixels_in_regions(
-    state: AttackState,
-    pixel_grad_raw: torch.Tensor,
-    ranked_regions: list[RankedRegion],
-    *,
-    top_per_region: int = DEFAULT_TOP_PIXELS_PER_REGION,
-) -> list[PixelCandidate]:
-    """Collect top pixel candidates from each ranked region."""
-    selected: list[PixelCandidate] = []
-    for region in ranked_regions:
-        selected.extend(
-            select_pixels_in_region(
-                state=state,
-                pixel_grad_raw=pixel_grad_raw,
-                image_box=region.image_box,
-                top_n=top_per_region,
-            )
-        )
-    selected.sort(key=lambda candidate: abs(candidate.grad_value), reverse=True)
-    return selected
 
 
 def compute_ssim(x_clean: torch.Tensor, x_adv: torch.Tensor, kernel_size: int = 11) -> float:
@@ -970,136 +913,6 @@ def commit_verified_delta(
     state.delta = delta_try.detach()
     state.changed_mask = state.delta.abs() > 1e-12
     state.logits = logits.detach().to(dtype=torch.float32)
-
-
-def try_accept_pixel_batch(
-    model: torch.nn.Module,
-    state: AttackState,
-    pixel_changes: list[PixelChange],
-    *,
-    true_idx: int,
-    competitor_idx: int,
-    gap_before: float,
-    untargeted_gap_before: float,
-    epsilon: float,
-    min_delta: float,
-    region: RankedRegion | None = None,
-    round_id: int = 0,
-    min_gain_per_pixel: float = DEFAULT_MIN_GAIN_PER_PIXEL,
-) -> tuple[bool, TrialVerification | None, AcceptedGroup | None]:
-    delta_try = build_delta_try_from_changes(state=state, pixel_changes=pixel_changes)
-    if delta_try is None:
-        return False, None, None
-
-    verification = verify_trial_delta(
-        model=model,
-        state=state,
-        delta_try=delta_try,
-        true_idx=true_idx,
-        competitor_idx=competitor_idx,
-        gap_before=gap_before,
-        untargeted_gap_before=untargeted_gap_before,
-        num_new_pixels=len(pixel_changes),
-        epsilon=epsilon,
-        min_delta=min_delta,
-        min_gain_per_pixel=min_gain_per_pixel,
-    )
-    if not verification.accepted:
-        return False, verification, None
-
-    commit_verified_delta(state=state, delta_try=delta_try, logits=verification.logits)
-
-    accepted_group = None
-    if region is not None:
-        accepted_group = AcceptedGroup(
-            competitor_idx=competitor_idx,
-            feature_cell=region.feature_cell,
-            image_box=region.image_box,
-            pixels=list(pixel_changes),
-            gap_before=verification.gap_before,
-            gap_after=verification.gap_after,
-            gain=verification.real_gain,
-            gain_per_pixel=verification.gain_per_pixel,
-            round_id=round_id,
-        )
-        state.accepted_groups.append(accepted_group)
-
-    return True, verification, accepted_group
-
-
-def apply_verified_pixel_candidates(
-    model: torch.nn.Module,
-    state: AttackState,
-    candidates: list[PixelCandidate],
-    ranked_regions: list[RankedRegion],
-    *,
-    true_idx: int,
-    competitor_idx: int,
-    epsilon: float,
-    min_delta: float,
-    max_delta: float,
-    max_pixels: int = DEFAULT_MAX_PIXELS_PER_STEP,
-    round_id: int = 0,
-) -> tuple[int, TrialVerification | None]:
-    """
-    Apply pixel candidates one-by-one with forward-pass verification.
-
-    Returns count applied and the last verification (or best flip seen).
-    """
-    gap_before = competitor_gap(state.logits.unsqueeze(0), true_idx, competitor_idx)
-    untargeted_gap_before = untargeted_gap(state.logits.unsqueeze(0), true_idx)
-    applied = 0
-    last_verification: TrialVerification | None = None
-    best_flip: TrialVerification | None = None
-
-    region_for_box: dict[tuple[int, int, int, int], RankedRegion] = {
-        region.image_box: region for region in ranked_regions
-    }
-
-    for candidate in candidates:
-        if applied >= max_pixels:
-            break
-        if state.linf + PIXEL_STEP_RAW > float(max_delta) + 1e-9:
-            break
-
-        change = candidate.as_change()
-        region = None
-        for image_box, ranked in region_for_box.items():
-            y1, y2, x1, x2 = image_box
-            if y1 <= change.y < y2 and x1 <= change.x < x2:
-                region = ranked
-                break
-
-        accepted, verification, _ = try_accept_pixel_batch(
-            model=model,
-            state=state,
-            pixel_changes=[change],
-            true_idx=true_idx,
-            competitor_idx=competitor_idx,
-            gap_before=gap_before,
-            untargeted_gap_before=untargeted_gap_before,
-            epsilon=epsilon,
-            min_delta=min_delta,
-            region=region,
-            round_id=round_id,
-        )
-        if verification is not None:
-            last_verification = verification
-            if verification.flip_candidate and (
-                best_flip is None or verification.norm < best_flip.norm
-            ):
-                best_flip = verification
-
-        if not accepted:
-            continue
-
-        applied += 1
-        gap_before = verification.gap_after if verification else gap_before
-        untargeted_gap_before = (
-            verification.untargeted_gap_after if verification else untargeted_gap_before
-        )
-
-    return applied, best_flip or last_verification
 
 
 def _clamp_grow_batch_size(batch_size: int) -> int:
@@ -1464,29 +1277,6 @@ def grow_ranked_regions(
     return total_applied, best_flip
 
 
-def apply_pixel_candidates(
-    state: AttackState,
-    candidates: list[PixelCandidate],
-    *,
-    max_delta: float,
-    max_pixels: int = DEFAULT_MAX_PIXELS_PER_STEP,
-) -> int:
-    """
-    Apply discrete ±1/255 updates without forward verification.
-
-    Prefer apply_verified_pixel_candidates during attack search.
-    """
-    applied = 0
-    for candidate in candidates:
-        if applied >= max_pixels:
-            break
-        if state.linf + PIXEL_STEP_RAW > float(max_delta) + 1e-9:
-            break
-        if apply_pixel_change(state, candidate.as_change()):
-            applied += 1
-    return applied
-
-
 def compute_competitor_gap_gradients(
     model: torch.nn.Module,
     adv_raw: torch.Tensor,
@@ -1573,81 +1363,12 @@ def compute_gap_cam(
     )
 
 
-def compute_gap_cams_for_competitors(
-    model: torch.nn.Module,
-    features: torch.Tensor,
-    true_idx: int,
-    competitor_indices: list[int] | tuple[int, ...],
-) -> list[CompetitorGapCam]:
-    """Gap CAM for each competitor in the current top-K race."""
-    return [
-        compute_gap_cam(
-            model=model,
-            features=features,
-            true_idx=true_idx,
-            competitor_idx=int(comp_idx),
-        )
-        for comp_idx in competitor_indices
-    ]
-
-
-def gap_cam_to_pixel_weights(
-    gap_cam: torch.Tensor,
-    target_hw: tuple[int, int],
-    *,
-    include_competitor_support: bool = True,
-    competitor_support_scale: float = 0.5,
-) -> torch.Tensor:
-    """
-    Upsample gap CAM to decoded image size for pixel-gradient weighting.
-
-    Mainly weight positive (true-supporting) cells; optionally include negative
-    competitor-supporting cells at reduced scale.
-    """
-    true_support = F.relu(gap_cam)
-    if include_competitor_support:
-        competitor_support = F.relu(-gap_cam) * float(competitor_support_scale)
-        weights = true_support + competitor_support
-    else:
-        weights = true_support
-
-    weights = F.interpolate(
-        weights.unsqueeze(0).unsqueeze(0),
-        size=target_hw,
-        mode="bilinear",
-        align_corners=False,
-    ).squeeze(0).squeeze(0)
-
-    peak = float(weights.max().item())
-    if peak > 1e-12:
-        weights = weights / peak
-    else:
-        weights = torch.ones_like(weights)
-    return weights.detach()
-
-
 def _as_feature_map(features: torch.Tensor) -> torch.Tensor:
     if features.ndim == 4:
         return features[0]
     if features.ndim == 3:
         return features
     raise ValueError(f"Expected feature map [1,C,H,W] or [C,H,W], got {tuple(features.shape)}")
-
-
-def _upsample_feature_map(feature_map: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
-    return F.interpolate(
-        feature_map.unsqueeze(0).unsqueeze(0),
-        size=target_hw,
-        mode="bilinear",
-        align_corners=False,
-    ).squeeze(0).squeeze(0)
-
-
-def _normalize_positive_map(values: torch.Tensor) -> torch.Tensor:
-    peak = float(values.max().item())
-    if peak > 1e-12:
-        return values / peak
-    return torch.ones_like(values)
 
 
 def compute_activation_gradient_maps(
@@ -1685,47 +1406,6 @@ def compute_competitor_activation_maps(
         abs_map=abs_map,
         dir_map=dir_map,
     )
-
-
-def activation_guided_pixel_weights(
-    abs_map: torch.Tensor,
-    dir_map: torch.Tensor,
-    gap_cam: torch.Tensor,
-    target_hw: tuple[int, int],
-    *,
-    include_competitor_support: bool = True,
-    competitor_support_scale: float = 0.5,
-) -> torch.Tensor:
-    """
-    Combine activation-gradient importance with gap CAM direction.
-
-    abs_map drives region ranking (which 15x15 cells control the gap).
-    dir_map + gap_cam provide directional interpretation.
-    """
-    abs_up = _upsample_feature_map(abs_map, target_hw)
-    dir_up = _upsample_feature_map(dir_map, target_hw)
-    gap_up = _upsample_feature_map(gap_cam, target_hw)
-
-    importance = _normalize_positive_map(abs_up)
-
-    true_support = F.relu(gap_up)
-    if include_competitor_support:
-        competitor_support = F.relu(-gap_up) * float(competitor_support_scale)
-        structural = true_support + competitor_support
-    else:
-        structural = true_support
-
-    # Positive dir_map: increasing activation raises gap -> prioritize reducing there.
-    # Negative dir_map: increasing activation lowers gap -> secondary competitor support.
-    directional = F.relu(dir_up) + float(competitor_support_scale) * F.relu(-dir_up)
-
-    weights = importance * (structural + 1e-6) * (directional + 1e-6)
-    peak = float(weights.max().item())
-    if peak > 1e-12:
-        weights = weights / peak
-    else:
-        weights = importance
-    return weights.detach()
 
 
 def compute_preprocess_geometry(raw_h: int, raw_w: int) -> PreprocessGeometry:
@@ -1817,46 +1497,6 @@ def feature_cell_to_raw_image_box(
     raw_x2 = resized_x2 * raw_w / geom.resized_w
 
     return _clip_raw_box(raw_y1, raw_y2, raw_x1, raw_x2, raw_h=raw_h, raw_w=raw_w)
-
-
-def feature_cells_to_raw_image_boxes(
-    feature_cells: list[tuple[int, int]] | tuple[tuple[int, int], ...],
-    raw_h: int,
-    raw_w: int,
-    *,
-    expand: float = FEATURE_CELL_EXPAND_FIRST,
-) -> list[tuple[int, int, int, int]]:
-    geometry = compute_preprocess_geometry(raw_h=raw_h, raw_w=raw_w)
-    return [
-        feature_cell_to_raw_image_box(
-            yf=yf,
-            xf=xf,
-            raw_h=raw_h,
-            raw_w=raw_w,
-            expand=expand,
-            geometry=geometry,
-        )
-        for yf, xf in feature_cells
-    ]
-
-
-def ranked_feature_cell_boxes(
-    abs_map: torch.Tensor,
-    raw_h: int,
-    raw_w: int,
-    *,
-    top_n: int,
-    expand: float = FEATURE_CELL_EXPAND_FIRST,
-) -> list[tuple[tuple[int, int], tuple[int, int, int, int]]]:
-    """Rank feature cells by abs_map and map each to a decoded-image box."""
-    cells = rank_feature_cells(abs_map=abs_map, top_n=top_n)
-    boxes = feature_cells_to_raw_image_boxes(
-        feature_cells=cells,
-        raw_h=raw_h,
-        raw_w=raw_w,
-        expand=expand,
-    )
-    return list(zip(cells, boxes))
 
 
 def _normalize_cell_grid(values: torch.Tensor) -> torch.Tensor:
@@ -2017,134 +1657,6 @@ def rank_competitor_regions(
     if top_regions <= 0:
         return rescored
     return rescored[: min(top_regions, len(rescored))]
-
-
-def rank_all_competitor_regions(
-    model: torch.nn.Module,
-    state: AttackState,
-    race: TopKCompetitorRace,
-    *,
-    top_regions_per_competitor: int = DEFAULT_TOP_REGIONS_PER_COMPETITOR,
-    expand: float = FEATURE_CELL_EXPAND_FIRST,
-    pixel_grad_top_n: int = REGION_PIXEL_GRAD_TOP_N,
-) -> list[RankedRegion]:
-    """Rank top regions for each competitor in the current top-K race."""
-    raw_h, raw_w = state.clean.shape[-2:]
-    ranked_all: list[RankedRegion] = []
-
-    for entry in race.competitors:
-        grad_pack = compute_competitor_gap_gradients(
-            model=model,
-            adv_raw=state.adv_raw,
-            true_idx=state.true_idx,
-            competitor_idx=entry.idx,
-        )
-        gap_cam_pack = compute_gap_cam(
-            model=model,
-            features=grad_pack.features,
-            true_idx=state.true_idx,
-            competitor_idx=entry.idx,
-        )
-        activation_maps = compute_competitor_activation_maps(grad_pack)
-        ranked_all.extend(
-            rank_competitor_regions(
-                gap_cam=gap_cam_pack.gap_cam,
-                abs_map=activation_maps.abs_map,
-                pixel_grad_raw=grad_pack.pixel_grad_raw,
-                competitor_idx=entry.idx,
-                raw_h=raw_h,
-                raw_w=raw_w,
-                top_regions=top_regions_per_competitor,
-                expand=expand,
-                pixel_grad_top_n=pixel_grad_top_n,
-            )
-        )
-
-    ranked_all.sort(key=lambda region: region.region_score, reverse=True)
-    return ranked_all
-
-
-def region_mask_from_ranked_regions(
-    ranked_regions: list[RankedRegion],
-    raw_h: int,
-    raw_w: int,
-    *,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """Boolean [H, W] mask covering all ranked region boxes."""
-    mask = torch.zeros((raw_h, raw_w), dtype=torch.bool, device=device)
-    for region in ranked_regions:
-        y1, y2, x1, x2 = region.image_box
-        mask[y1:y2, x1:x2] = True
-    return mask
-
-
-def rank_feature_cells(abs_map: torch.Tensor, top_n: int) -> list[tuple[int, int]]:
-    """Rank feature cells by activation-gradient importance (pair with feature_cell_to_raw_image_box)."""
-    flat = abs_map.reshape(-1)
-    if flat.numel() == 0 or top_n <= 0:
-        return []
-
-    count = min(top_n, flat.numel())
-    _, indices = torch.topk(flat, k=count, largest=True)
-    height, width = abs_map.shape
-    ranked: list[tuple[int, int]] = []
-    for index in indices.tolist():
-        yf = int(index // width)
-        xf = int(index % width)
-        ranked.append((yf, xf))
-    return ranked
-
-
-def gap_cam_from_feature_grad(
-    features: torch.Tensor,
-    feature_grad: torch.Tensor | None,
-    target_hw: tuple[int, int],
-) -> torch.Tensor:
-    """Legacy activation-gradient map; prefer compute_gap_cam for competitor weighting."""
-    if feature_grad is None:
-        return torch.ones(target_hw, device=features.device, dtype=features.dtype)
-
-    weights = feature_grad.mean(dim=(2, 3), keepdim=True)
-    cam = (weights * features).sum(dim=1, keepdim=True).relu()
-    cam = F.interpolate(
-        cam,
-        size=target_hw,
-        mode="bilinear",
-        align_corners=False,
-    )
-    cam = cam.squeeze(0).squeeze(0)
-    peak = float(cam.max().item())
-    if peak > 1e-12:
-        cam = cam / peak
-    return cam.detach()
-
-
-def compute_raw_space_gradients(
-    model: torch.nn.Module,
-    state: AttackState,
-    competitor_idx: int,
-) -> CompetitorGapGradients:
-    """Compute gap gradients for current attack state and one competitor."""
-    return compute_competitor_gap_gradients(
-        model=model,
-        adv_raw=state.adv_raw,
-        true_idx=state.true_idx,
-        competitor_idx=competitor_idx,
-    )
-
-
-def _sparse_update_mask(
-    guided_grad: torch.Tensor,
-    fraction: float,
-) -> torch.Tensor:
-    flat = guided_grad.abs().reshape(-1)
-    if flat.numel() == 0:
-        return torch.zeros_like(guided_grad, dtype=torch.bool)
-
-    count = max(1, int(flat.numel() * fraction))
-    threshold = torch.topk(flat, count, largest=True).values[-1]
-    return guided_grad.abs() >= threshold
 
 
 def clone_attack_state(state: AttackState) -> AttackState:
@@ -3274,33 +2786,6 @@ def _roundtrip_restore_candidates(
     return candidates
     
 
-def _roundtrip_decoded_passes(
-    model: torch.nn.Module,
-    clean: torch.Tensor,
-    decoded: torch.Tensor,
-    true_idx: int,
-    *,
-    min_delta: float,
-    max_delta: float,
-) -> bool:
-    if decoded.shape != clean.shape:
-        return False
-    pred_idx = inference_predict_index(model=model, image_chw=decoded)
-    stats = candidate_stats(clean, decoded)
-    if pred_idx == true_idx:
-        return False
-    if stats.norm < float(min_delta) - 1e-9 or stats.norm > float(max_delta) + 1e-9:
-        return False
-    return validator_passes_adv(
-        model=model,
-        clean=clean,
-        adv=decoded,
-        true_idx=true_idx,
-        min_delta=min_delta,
-        max_delta=max_delta,
-    )
-
-
 def png_roundtrip_verify(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -3412,31 +2897,6 @@ def png_roundtrip_verify(
         restored_from_backup=False,
         reason=last_reason,
     )
-
-
-def final_validate_roundtrip(
-    model: torch.nn.Module,
-    clean: torch.Tensor,
-    adv: torch.Tensor,
-    true_idx: int,
-    *,
-    min_delta: float,
-    max_delta: float,
-    accepted_groups: list[AcceptedGroup] | None = None,
-    restore_adv_candidates: list[torch.Tensor] | None = None,
-) -> torch.Tensor:
-    """Backward-compatible wrapper around png_roundtrip_verify."""
-    result = png_roundtrip_verify(
-        model=model,
-        clean=clean,
-        adv=adv,
-        true_idx=true_idx,
-        min_delta=min_delta,
-        max_delta=max_delta,
-        accepted_groups=accepted_groups,
-        restore_adv_candidates=restore_adv_candidates,
-    )
-    return result.final_adv
 
 
 def roundtrip_pixel_prune(
@@ -3948,61 +3408,6 @@ def run_feature_guided_attack(
     )
 
 
-def feature_guided_sparse_untargeted_attack(
-    model: torch.nn.Module,
-    clean: torch.Tensor,
-    true_idx: int,
-    epsilon: float,
-    min_delta: float,
-    timeout_seconds: float | int,
-    *,
-    steps: int = DEFAULT_STEPS,
-    sparse_fraction: float = SPARSE_PIXEL_FRACTION,
-    hyperparams: AttackHyperparams | None = None,
-    top_k: int | None = None,
-    beam_width: int | None = None,
-    top_regions: int | None = None,
-) -> torch.Tensor:
-    """
-    Untargeted attack in decoded raw image space [3, H, W] in [0, 1].
-
-    Timeout-aware beam search with phased budgets:
-    60% search, 25% pruning, 10% PNG roundtrip validation, 5% buffer.
-    """
-    output = run_feature_guided_attack(
-        model=model,
-        clean=clean,
-        true_idx=true_idx,
-        epsilon=epsilon,
-        min_delta=min_delta,
-        timeout_seconds=timeout_seconds,
-        steps=steps,
-        sparse_fraction=sparse_fraction,
-        hyperparams=hyperparams,
-        top_k=top_k,
-        beam_width=beam_width,
-        top_regions=top_regions,
-    )
-
-    max_delta = _effective_max_delta(epsilon)
-    min_delta = float(min_delta)
-    budget = AttackTimeBudget.from_timeout(timeout_seconds)
-
-    if time.monotonic() < budget.validate_end:
-        return final_validate_roundtrip(
-            model=model,
-            clean=clean,
-            adv=output.adv,
-            true_idx=true_idx,
-            min_delta=min_delta,
-            max_delta=max_delta,
-            accepted_groups=output.accepted_groups,
-            restore_adv_candidates=[output.pre_prune_adv],
-        ).clamp(0.0, 1.0)
-
-    return output.adv
-
-
 def finalize_miner_adversarial(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -4120,17 +3525,3 @@ def finalize_miner_adversarial(
         session.log_final_validation(final_snap, pgd_used=pgd_used)
 
     return roundtrip.final_adv, roundtrip, final_stats
-
-
-# Miner-facing aliases matching the documented helper layout (step 16).
-get_topk_competitors = compute_top_k_competitors
-compute_gap_cam_for_competitor = compute_gap_cam
-compute_activation_gradient_map = compute_activation_gradient_maps
-feature_cell_to_raw_box = feature_cell_to_raw_image_box
-rank_regions = rank_competitor_regions
-select_pixels_in_region_box = select_pixels_in_region
-apply_pixel_batch = build_delta_try_from_changes
-test_pixel_batch = verify_trial_delta
-grow_region_verified = grow_ranked_region
-prune_accepted_groups = prune_validator_aware_state
-prune_pixel_chunks = prune_validator_aware_state
