@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from perturbnet.constants import MIN_PSNR_DB, MIN_SSIM, TIMEOUT_SECONDS
 from perturbnet.image_io import decode_image_b64, encode_image_b64
-from perturbnet.model import forward_logits_features, logits_for_images, predict_index, predict_label
+from perturbnet.model import forward_logits_features, logits_for_images, predict_label
 
 from neurons.attack_log import AttackLogSession, build_validator_snapshot, idx_label
 
@@ -62,7 +62,6 @@ SPARSE_FALLBACK_MAX_CANDIDATES = int(os.getenv("PERTURB_SPARSE_FALLBACK_MAX_CAND
 TOP_K_FAST = 5
 TOP_K_STARTING = 8
 TOP_K_STRONG = 20
-DEFAULT_TOP_K = TOP_K_STRONG
 
 # Region ranking.
 TOP_REGIONS_FAST = 4
@@ -469,6 +468,7 @@ class AttackState:
 
 
 def _logits_row(logits: torch.Tensor) -> torch.Tensor:
+    """Strip a leading batch dim from model output [1, num_classes] -> [num_classes]."""
     if logits.ndim == 2:
         return logits[0]
     return logits
@@ -479,9 +479,17 @@ def inference_logits(model: torch.nn.Module, image_chw: torch.Tensor) -> torch.T
     return logits_for_images(model=model, image_bchw=image_chw.unsqueeze(0))
 
 
+def _inference_logits_row(model: torch.nn.Module, image_chw: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """One forward pass: float32 logits row [num_classes] and predicted class index."""
+    with torch.no_grad():
+        row = _logits_row(inference_logits(model=model, image_chw=image_chw))
+        row = row.detach().to(dtype=torch.float32)
+        return row, int(row.argmax().item())
+
+
 def inference_predict_index(model: torch.nn.Module, image_chw: torch.Tensor) -> int:
     """Canonical class index via perturbnet.model (includes PREPROCESS)."""
-    return predict_index(model=model, image_chw=image_chw)
+    return _inference_logits_row(model=model, image_chw=image_chw)[1]
 
 
 def inference_predict_label(model: torch.nn.Module, image_chw: torch.Tensor) -> str:
@@ -490,16 +498,17 @@ def inference_predict_label(model: torch.nn.Module, image_chw: torch.Tensor) -> 
 
 
 def compute_top_k_competitors(
-    logits: torch.Tensor,
+    logits_row: torch.Tensor,
     true_idx: int,
-    k: int = DEFAULT_TOP_K,
+    k: int,
 ) -> TopKCompetitorRace:
     """
     Rank top-K non-true classes by logit for dynamic untargeted competitor race.
 
+    ``logits_row`` is a single 1-D vector [num_classes] (same layout as AttackState.logits).
     gap_k = logit_true - logit_competitor (positive while true class still leads).
     """
-    row = _logits_row(logits).detach().float()
+    row = logits_row.detach().float().reshape(-1)
     true_logit = float(row[true_idx].item())
 
     masked = row.clone()
@@ -522,8 +531,8 @@ def compute_top_k_competitors(
     return TopKCompetitorRace(true_idx=true_idx, true_logit=true_logit, competitors=competitors)
 
 
-def refresh_competitor_race(state: AttackState, k: int = DEFAULT_TOP_K) -> TopKCompetitorRace:
-    race = compute_top_k_competitors(logits=state.logits.unsqueeze(0), true_idx=state.true_idx, k=k)
+def refresh_competitor_race(state: AttackState, k: int) -> TopKCompetitorRace:
+    race = compute_top_k_competitors(logits_row=state.logits, true_idx=state.true_idx, k=k)
     state.top_k_competitors = list(race.competitors)
     if race.competitors:
         state.current_competitor_idx = race.easiest.idx
@@ -532,22 +541,23 @@ def refresh_competitor_race(state: AttackState, k: int = DEFAULT_TOP_K) -> TopKC
     return race
 
 
-def competitor_gap(logits: torch.Tensor, true_idx: int, competitor_idx: int) -> float:
-    row = _logits_row(logits)
-    return float((row[true_idx] - row[competitor_idx]).item())
+def competitor_gap(logits_row: torch.Tensor, true_idx: int, competitor_idx: int) -> float:
+    return float((logits_row[true_idx] - logits_row[competitor_idx]).item())
 
 
-def untargeted_gap(logits: torch.Tensor, true_idx: int) -> float:
-    race = compute_top_k_competitors(logits=logits, true_idx=true_idx, k=1)
-    if not race.competitors:
-        return 0.0
-    return race.competitors[0].gap_k
+def untargeted_gap(logits_row: torch.Tensor, true_idx: int) -> float:
+    """logit_true - max(logit_other); equivalent to the easiest top-1 competitor gap."""
+    masked = logits_row.clone()
+    masked[true_idx] = float("-inf")
+    return float((logits_row[true_idx] - masked.max()).item())
 
 
 def init_attack_state(
     model: torch.nn.Module,
     clean: torch.Tensor,
     true_idx: int,
+    *,
+    top_k: int,
 ) -> AttackState:
     """
     Build attack state from decoded challenge image [3, H, W] in [0, 1].
@@ -560,11 +570,7 @@ def init_attack_state(
     delta = torch.zeros_like(clean)
     changed_mask = torch.zeros_like(clean, dtype=torch.bool)
 
-    with torch.no_grad():
-        logits = _logits_row(inference_logits(model=model, image_chw=clean))
-        logits = logits.detach().to(dtype=torch.float32)
-
-    pred_idx = inference_predict_index(model=model, image_chw=clean)
+    logits, pred_idx = _inference_logits_row(model=model, image_chw=clean)
     if pred_idx != true_idx:
         logger.warning(
             "Provided true_idx=%s does not match clean model prediction=%s",
@@ -579,15 +585,13 @@ def init_attack_state(
         true_idx=true_idx,
         logits=logits,
     )
-    refresh_competitor_race(state, k=DEFAULT_TOP_K)
+    refresh_competitor_race(state, k=top_k)
     return state
 
 
-def refresh_state_logits(model: torch.nn.Module, state: AttackState, *, top_k: int = DEFAULT_TOP_K) -> None:
-    with torch.no_grad():
-        state.logits = _logits_row(
-            inference_logits(model=model, image_chw=state.adv)
-        ).detach().to(dtype=torch.float32)
+def refresh_state_logits(model: torch.nn.Module, state: AttackState, *, top_k: int) -> None:
+    logits, _ = _inference_logits_row(model=model, image_chw=state.adv)
+    state.logits = logits
     refresh_competitor_race(state, k=top_k)
 
 
@@ -808,17 +812,15 @@ def verify_trial_delta(
     logits via logits_for_images (includes PREPROCESS).
     """
     adv_try = (state.clean + delta_try).clamp(0.0, 1.0)
-    logits = inference_logits(model=model, image_chw=adv_try)
-    row = _logits_row(logits)
-    pred_idx = int(row.argmax().item())
+    row, pred_idx = _inference_logits_row(model=model, image_chw=adv_try)
 
     norm = float((adv_try - state.clean).abs().max().item())
     rmse = float(torch.sqrt(torch.mean((adv_try - state.clean) ** 2)).item())
     ssim = compute_ssim(state.clean, adv_try)
     psnr_db = compute_psnr_db(state.clean, adv_try)
 
-    gap_after = competitor_gap(logits, true_idx, competitor_idx)
-    untargeted_gap_after = untargeted_gap(logits, true_idx)
+    gap_after = competitor_gap(row, true_idx, competitor_idx)
+    untargeted_gap_after = untargeted_gap(row, true_idx)
     real_gain = float(gap_before - gap_after)
     gain_per_pixel = real_gain / max(int(num_new_pixels), 1)
 
@@ -1106,8 +1108,8 @@ def grow_ranked_region(
         region=region,
         batch_size=int(initial_batch or REGION_GROW_INITIAL_BATCH),
     )
-    gap_before = competitor_gap(state.logits.unsqueeze(0), true_idx, competitor_idx)
-    untargeted_gap_before = untargeted_gap(state.logits.unsqueeze(0), true_idx)
+    gap_before = competitor_gap(state.logits, true_idx, competitor_idx)
+    untargeted_gap_before = untargeted_gap(state.logits, true_idx)
     best_verification: TrialVerification | None = None
     stopped_reason = "not_started"
 
@@ -1681,7 +1683,7 @@ def build_beam_node(
 ) -> BeamNode:
     logits_row = state.logits
     pred_idx = int(logits_row.argmax().item())
-    untargeted = untargeted_gap(logits_row.unsqueeze(0), state.true_idx)
+    untargeted = untargeted_gap(logits_row, state.true_idx)
     adv = state.adv
     return BeamNode(
         state=state,
@@ -1803,7 +1805,7 @@ def expand_beam_node(
     child_state = clone_attack_state(node.state)
     with torch.no_grad():
         race = compute_top_k_competitors(
-            logits=child_state.logits.unsqueeze(0),
+            logits_row=child_state.logits,
             true_idx=true_idx,
             k=top_k,
         )
@@ -1907,7 +1909,12 @@ def run_beam_search_phase(
     region_grow_max_pixels_per_region: int = REGION_GROW_MAX_PIXELS_PER_REGION,
     log_session: AttackLogSession | None = None,
 ) -> tuple[list[BeamNode], BeamNode | None]:
-    initial_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
+    initial_state = init_attack_state(
+        model=model,
+        clean=clean,
+        true_idx=true_idx,
+        top_k=top_k,
+    )
     beam = [build_beam_node(initial_state)]
     best_flip: BeamNode | None = None
 
@@ -1921,7 +1928,7 @@ def run_beam_search_phase(
             logits_source = beam[0].state.logits if beam else initial_state.logits
             with torch.no_grad():
                 race = compute_top_k_competitors(
-                    logits=logits_source.unsqueeze(0),
+                    logits_row=logits_source,
                     true_idx=true_idx,
                     k=top_k,
                 )
@@ -1958,7 +1965,7 @@ def run_beam_search_phase(
             )
             with torch.no_grad():
                 race = compute_top_k_competitors(
-                    logits=fallback_state.logits.unsqueeze(0),
+                    logits_row=fallback_state.logits,
                     true_idx=true_idx,
                     k=top_k,
                 )
@@ -2047,7 +2054,7 @@ def deepen_beam_node(
     state = clone_attack_state(node.state)
     with torch.no_grad():
         race = compute_top_k_competitors(
-            logits=state.logits.unsqueeze(0),
+            logits_row=state.logits,
             true_idx=true_idx,
             k=top_k,
         )
@@ -2223,7 +2230,7 @@ def prune_validator_aware_state(
     true_idx: int,
     min_delta: float,
     max_delta: float,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: int = DEFAULT_BEAM_TOP_K,
     deadline: float | None = None,
     log_session: AttackLogSession | None = None,
 ) -> AttackState:
@@ -2632,8 +2639,7 @@ def check_flip_and_gap(
     adv: torch.Tensor,
     true_idx: int,
 ) -> FlipGapStats:
-    logits = _logits_row(inference_logits(model=model, image_chw=adv)).detach().to(dtype=torch.float32)
-    pred_idx = int(logits.argmax().item())
+    logits, pred_idx = _inference_logits_row(model=model, image_chw=adv)
     masked = logits.clone()
     masked[true_idx] = float("-inf")
     best_other_idx = int(masked.argmax().item())
@@ -2643,7 +2649,7 @@ def check_flip_and_gap(
         true_idx=true_idx,
         pred_idx=pred_idx,
         best_other_idx=best_other_idx,
-        untargeted_gap=untargeted_gap(logits.unsqueeze(0), true_idx),
+        untargeted_gap=untargeted_gap(logits, true_idx),
         norm=stats.norm,
         rmse=stats.rmse,
     )
@@ -2926,6 +2932,7 @@ def pgd_fallback_attack(
     max_delta: float,
     min_delta: float,
     deadline: float,
+    top_k: int,
     steps: int = 10,
 ) -> torch.Tensor:
     return _pgd_fallback_attack(
@@ -2935,6 +2942,7 @@ def pgd_fallback_attack(
         max_delta=max_delta,
         min_delta=min_delta,
         deadline=deadline,
+        top_k=top_k,
         steps=steps,
     )
 
@@ -2947,6 +2955,7 @@ def _pgd_fallback_attack(
     max_delta: float,
     min_delta: float,
     deadline: float,
+    top_k: int,
     steps: int = 10,
 ) -> torch.Tensor:
     """
@@ -2977,7 +2986,7 @@ def _pgd_fallback_attack(
     ):
         state.delta = base_delta
         state.changed_mask = state.delta.abs() > 1e-12
-        refresh_state_logits(model=model, state=state, top_k=DEFAULT_TOP_K)
+        refresh_state_logits(model=model, state=state, top_k=top_k)
         return state.adv
 
     if time.monotonic() >= deadline:
@@ -3106,7 +3115,7 @@ def _pgd_fallback_attack(
     ):
         state.delta = (best_adv - clean).detach()
         state.changed_mask = state.delta.abs() > 1e-12
-        refresh_state_logits(model=model, state=state, top_k=DEFAULT_TOP_K)
+        refresh_state_logits(model=model, state=state, top_k=top_k)
         return state.adv
 
     # Do NOT return dense/multi-step fallback.
@@ -3160,7 +3169,12 @@ def run_feature_guided_attack(
         budget=budget,
     )
 
-    initial_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
+    initial_state = init_attack_state(
+        model=model,
+        clean=clean,
+        true_idx=true_idx,
+        top_k=top_k,
+    )
     start_snap = build_validator_snapshot(
         logits=initial_state.logits,
         true_idx=true_idx,
@@ -3207,7 +3221,12 @@ def run_feature_guided_attack(
     )
 
     if best_node is None:
-        fallback_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
+        fallback_state = init_attack_state(
+            model=model,
+            clean=clean,
+            true_idx=true_idx,
+            top_k=top_k,
+        )
         adv = fallback_state.adv
         pre_prune_adv = adv.clone()
         accepted_groups: list[AcceptedGroup] = []
@@ -3252,6 +3271,7 @@ def run_feature_guided_attack(
             max_delta=max_delta,
             min_delta=validator_min_delta,
             deadline=budget.hard_end,
+            top_k=top_k,
             steps=min(10, DEFAULT_STEPS),
         )
         flip_stats = check_flip_and_gap(model=model, clean=clean, adv=adv, true_idx=true_idx)
@@ -3323,13 +3343,16 @@ def finalize_miner_adversarial(
 
     if not stats.flipped and deadline is not None:
         pgd_used = True
+        fallback_state = attack_output.fallback_state
+        top_k = len(fallback_state.top_k_competitors) or DEFAULT_BEAM_TOP_K
         adv = pgd_fallback_attack(
             model=model,
-            state=attack_output.fallback_state,
+            state=fallback_state,
             true_idx=true_idx,
             max_delta=max_delta,
             min_delta=min_delta,
             deadline=deadline,
+            top_k=top_k,
             steps=pgd_steps,
         )
         stats = check_flip_and_gap(model=model, clean=clean, adv=adv, true_idx=true_idx)
