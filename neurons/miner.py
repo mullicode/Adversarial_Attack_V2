@@ -204,7 +204,7 @@ class PerturbMiner:
             "no",
             "off",
         }
-        one_step_max = (1.0 / 255.0) + 1e-7
+        one_step_max = 1.0 / 255.0
 
         if strict_one_step:
             effective_max = min(epsilon, float(MAX_LINF_DELTA), one_step_max)

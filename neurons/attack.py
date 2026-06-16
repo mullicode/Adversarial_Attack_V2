@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
-from perturbnet.constants import MAX_LINF_DELTA, MIN_PSNR_DB, MIN_SSIM, TIMEOUT_SECONDS
+from perturbnet.constants import MIN_PSNR_DB, MIN_SSIM, TIMEOUT_SECONDS
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import forward_logits_features, logits_for_images, predict_index, predict_label
 
@@ -32,14 +32,6 @@ PIXEL_STEP_RAW = 1.0 / 255.0
 # Winner-quality subnet attacks should stay at exactly one uint8 step.
 # Validator winners are commonly norm=0.003922, i.e. 1/255.
 # Do not allow PGD/fallback to use 2/255, 3/255, etc.
-STRICT_ONE_STEP_LINF = os.getenv("PERTURB_STRICT_ONE_STEP_LINF", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-ONE_STEP_LINF_TOL = 1e-7
-MAX_STRICT_LINF = PIXEL_STEP_RAW + ONE_STEP_LINF_TOL
 
 # Sparse fallback tries only one-step ±1/255 candidates, never dense multi-step PGD.
 SPARSE_FALLBACK_PREFIX_SIZES = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
@@ -477,16 +469,13 @@ def inference_predict_label(model: torch.nn.Module, image_chw: torch.Tensor) -> 
 
 
 def _effective_max_delta(epsilon: float) -> float:
-    """
-    Effective Linf limit used by the miner attack engine.
+    """Linf cap passed from the miner (already clamped to subnet policy)."""
+    return float(epsilon)
 
-    For score quality, keep attack at one raw uint8 step when STRICT_ONE_STEP_LINF is on.
-    This prevents fallback from producing 2/255, 3/255, etc.
-    """
-    base = min(float(epsilon), float(MAX_LINF_DELTA))
-    if STRICT_ONE_STEP_LINF:
-        return min(base, float(MAX_STRICT_LINF))
-    return base
+
+def _uses_one_step_linf_cap(max_delta: float) -> bool:
+    """True when the miner capped Linf to a single ±1/255 step."""
+    return float(max_delta) <= PIXEL_STEP_RAW + 1e-9
 
 
 def compute_top_k_competitors(
@@ -2698,7 +2687,7 @@ def enforce_one_step_delta(clean: torch.Tensor, adv: torch.Tensor) -> torch.Tens
 
 def one_step_linf_ok(clean: torch.Tensor, adv: torch.Tensor) -> bool:
     norm = float((adv - clean).abs().max().item())
-    return norm <= float(MAX_STRICT_LINF) + 1e-9
+    return norm <= PIXEL_STEP_RAW + 1e-9
 
 def check_flip_and_gap(
     model: torch.nn.Module,
@@ -2799,7 +2788,8 @@ def png_roundtrip_verify(
     Instead of returning the first passing candidate, test all candidate sources
     and return the lowest-RMSE validator-passing decoded tensor.
     """
-    strict_max_delta = min(float(max_delta), float(MAX_STRICT_LINF)) if STRICT_ONE_STEP_LINF else float(max_delta)
+    strict_max_delta = float(max_delta)
+    one_step_cap = _uses_one_step_linf_cap(max_delta)
 
     trial_adv_list = _roundtrip_restore_candidates(
         clean=clean,
@@ -2817,7 +2807,7 @@ def png_roundtrip_verify(
     last_reason = "no_candidate"
 
     for index, trial_adv in enumerate(trial_adv_list):
-        if STRICT_ONE_STEP_LINF:
+        if one_step_cap:
             trial_adv = enforce_one_step_delta(clean, trial_adv)
 
         encoded = encode_image_b64(trial_adv)
@@ -2844,7 +2834,7 @@ def png_roundtrip_verify(
             continue
 
         if stats.norm > strict_max_delta + 1e-9:
-            last_reason = "above_one_step_linf" if STRICT_ONE_STEP_LINF else "above_max_delta"
+            last_reason = "above_one_step_linf" if one_step_cap else "above_max_delta"
             continue
 
         ssim = compute_ssim(clean, decoded)
@@ -2875,7 +2865,7 @@ def png_roundtrip_verify(
         return best_result
 
     if last_decoded is None:
-        fallback = enforce_one_step_delta(clean, adv) if STRICT_ONE_STEP_LINF else adv.detach().clamp(0.0, 1.0)
+        fallback = enforce_one_step_delta(clean, adv) if one_step_cap else adv.detach().clamp(0.0, 1.0)
         last_encoded = encode_image_b64(fallback)
         last_decoded = decode_image_b64(last_encoded).to(device=clean.device)
         last_stats = candidate_stats(clean, last_decoded)
@@ -2954,7 +2944,7 @@ def roundtrip_pixel_prune(
                 for c, y, x in chunk.tolist():
                     trial[int(c), int(y), int(x)] = clean[int(c), int(y), int(x)]
 
-                if STRICT_ONE_STEP_LINF:
+                if _uses_one_step_linf_cap(max_delta):
                     trial = enforce_one_step_delta(clean, trial)
 
                 encoded = encode_image_b64(trial)
@@ -3049,10 +3039,10 @@ def _pgd_fallback_attack(
     """
     del steps
 
-    # Hard cap fallback to one-step Linf.
-    max_delta = min(float(max_delta), float(MAX_STRICT_LINF)) if STRICT_ONE_STEP_LINF else float(max_delta)
+    one_step_cap = _uses_one_step_linf_cap(max_delta)
+    max_delta = float(max_delta)
 
-    base_adv = enforce_one_step_delta(state.clean, state.adv) if STRICT_ONE_STEP_LINF else state.adv.detach().clone()
+    base_adv = enforce_one_step_delta(state.clean, state.adv) if one_step_cap else state.adv.detach().clone()
     base_delta = (base_adv - state.clean).detach()
 
     # If current sparse state already flips under one-step rule, keep it.
