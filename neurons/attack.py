@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 FEATURE_MAP_SIZE = 15
 MODEL_CROP_SIZE = 480
-SPARSE_PIXEL_FRACTION = 0.05
 DEFAULT_STEPS = 40
 
 # Feature-cell box expansion in 480×480 crop space (one cell ≈ 32×32 px).
@@ -3212,31 +3211,18 @@ def run_feature_guided_attack(
     min_delta: float,
     timeout_seconds: float | int,
     *,
-    steps: int = DEFAULT_STEPS,
-    sparse_fraction: float = SPARSE_PIXEL_FRACTION,
     hyperparams: AttackHyperparams | None = None,
-    top_k: int | None = None,
-    beam_width: int | None = None,
-    top_regions: int | None = None,
-    flip_margin_before_prune: float | None = None,
     task_id: str = "unknown",
     true_label: str = "",
-    log_session: AttackLogSession | None = None,
 ) -> FeatureGuidedAttackOutput:
     """
     Full feature-guided attack with metadata for miner finalization (steps 4-7).
     """
-    del sparse_fraction
-
     hp = hyperparams or DEFAULT_ATTACK_HYPERPARAMS
-    resolved_top_k = int(top_k if top_k is not None else hp.top_k)
-    resolved_beam_width = int(beam_width if beam_width is not None else hp.beam_width)
-    resolved_top_regions = int(top_regions if top_regions is not None else hp.top_regions_per_competitor)
-    resolved_flip_margin = float(
-        flip_margin_before_prune
-        if flip_margin_before_prune is not None
-        else hp.flip_margin_before_prune
-    )
+    top_k = hp.top_k
+    beam_width = hp.beam_width
+    top_regions = hp.top_regions_per_competitor
+    flip_margin_before_prune = hp.flip_margin_before_prune
 
     max_delta = _effective_max_delta(epsilon)
     min_delta = float(min_delta)
@@ -3248,22 +3234,20 @@ def run_feature_guided_attack(
         buffer_fraction=hp.buffer_time_fraction,
     )
 
-    effective_beam_width = resolved_beam_width
+    effective_beam_width = beam_width
     if hp.shrink_beam_on_short_timeout and float(timeout_seconds) <= float(TIMEOUT_SECONDS):
-        effective_beam_width = min(resolved_beam_width, ATTACK_PRESET_FAST.beam_width)
+        effective_beam_width = min(beam_width, ATTACK_PRESET_FAST.beam_width)
 
-    session = log_session
-    if session is None:
-        session = AttackLogSession.create(
-            task_id=task_id,
-            true_idx=true_idx,
-            true_label=true_label or idx_label(true_idx),
-            min_delta=min_delta,
-            epsilon=float(epsilon),
-            effective_max_delta=max_delta,
-            timeout_seconds=float(timeout_seconds),
-            budget=budget,
-        )
+    session = AttackLogSession.create(
+        task_id=task_id,
+        true_idx=true_idx,
+        true_label=true_label or idx_label(true_idx),
+        min_delta=min_delta,
+        epsilon=float(epsilon),
+        effective_max_delta=max_delta,
+        timeout_seconds=float(timeout_seconds),
+        budget=budget,
+    )
 
     initial_state = init_attack_state(model=model, clean=clean, true_idx=true_idx)
     start_snap = build_validator_snapshot(
@@ -3285,9 +3269,9 @@ def run_feature_guided_attack(
         min_delta=min_delta,
         budget=budget,
         beam_width=effective_beam_width,
-        top_k=resolved_top_k,
-        top_regions=resolved_top_regions,
-        max_rounds=int(steps),
+        top_k=top_k,
+        top_regions=top_regions,
+        max_rounds=DEFAULT_STEPS,
         region_grow_initial_batch=hp.region_grow_initial_batch,
         region_grow_max_pixels_per_region=hp.region_grow_max_pixels_per_region,
         log_session=session,
@@ -3299,12 +3283,12 @@ def run_feature_guided_attack(
             beam=beam,
             true_idx=true_idx,
             epsilon=epsilon,
-            top_k=resolved_top_k,
+            top_k=top_k,
             beam_width=effective_beam_width,
             min_delta=min_delta,
             max_delta=max_delta,
             budget=budget,
-            top_regions=resolved_top_regions,
+            top_regions=top_regions,
             region_grow_max_pixels_per_region=hp.region_grow_max_pixels_per_region,
             log_session=session,
         )
@@ -3327,7 +3311,7 @@ def run_feature_guided_attack(
         flip_stats = check_flip_and_gap(model=model, clean=clean, adv=pre_prune_adv, true_idx=true_idx)
         if _is_valid_flip_node(best_node, min_delta=min_delta, max_delta=max_delta) and _has_flip_margin(
             flip_stats,
-            margin=resolved_flip_margin,
+            margin=flip_margin_before_prune,
         ):
             pruned_state = prune_validator_aware_state(
                 model=model,
@@ -3335,7 +3319,7 @@ def run_feature_guided_attack(
                 true_idx=true_idx,
                 min_delta=min_delta,
                 max_delta=max_delta,
-                top_k=resolved_top_k,
+                top_k=top_k,
                 deadline=budget.validate_end,
                 log_session=session,
             )
@@ -3362,7 +3346,7 @@ def run_feature_guided_attack(
             max_delta=max_delta,
             min_delta=min_delta,
             deadline=budget.hard_end,
-            steps=min(10, int(steps)),
+            steps=min(10, DEFAULT_STEPS),
         )
         flip_stats = check_flip_and_gap(model=model, clean=clean, adv=adv, true_idx=true_idx)
 
