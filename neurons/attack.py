@@ -2192,7 +2192,6 @@ def build_beam_node(
         expansion_idx=expansion_idx,
     )
 
-
 def beam_rank_key(
     node: BeamNode,
     *,
@@ -2200,35 +2199,54 @@ def beam_rank_key(
     max_delta: float,
 ) -> tuple[float, ...]:
     """
-    Rank beam paths (lower is better):
+    Lower is better.
 
-    1. flipped with valid norm
-    2. lower untargeted gap
-    3. fewer changed pixel-channels
-    4. higher recent gain_per_pixel
-    5. lower RMSE
+    In strict one-step Linf mode, many successful candidates have the same norm=1/255.
+    Therefore shortest RMSE is mostly controlled by changed pixel-channel count.
     """
     valid_flip = (
         node.flipped
         and node.norm >= float(min_delta) - 1e-9
         and node.norm <= float(max_delta) + 1e-9
     )
+
     if valid_flip:
+        margin = -float(node.untargeted_gap)  # bigger positive margin is safer
         return (
             0.0,
-            node.norm,
             float(node.changed_pixels),
-            -node.recent_gain_per_pixel,
-            node.rmse,
+            float(node.rmse),
+            float(node.norm),
+            -margin,
+            -float(node.recent_gain_per_pixel),
         )
+
     return (
         1.0,
-        node.untargeted_gap,
+        float(node.untargeted_gap),
         float(node.changed_pixels),
-        -node.recent_gain_per_pixel,
-        node.rmse,
+        float(node.rmse),
+        -float(node.recent_gain_per_pixel),
     )
 
+
+def _better_flip_node(
+    candidate: BeamNode,
+    current: BeamNode | None,
+    *,
+    min_delta: float,
+    max_delta: float,
+) -> bool:
+    if not _is_valid_flip_node(candidate, min_delta=min_delta, max_delta=max_delta):
+        return False
+    if current is None:
+        return True
+    return beam_rank_key(candidate, min_delta=min_delta, max_delta=max_delta) < beam_rank_key(
+        current,
+        min_delta=min_delta,
+        max_delta=max_delta,
+    )
+    
 
 def _is_valid_flip_node(node: BeamNode, *, min_delta: float, max_delta: float) -> bool:
     return (
@@ -2462,9 +2480,8 @@ def run_beam_search_phase(
             )
             if child is not None:
                 children.append(child)
-                if _is_valid_flip_node(child, min_delta=min_delta, max_delta=max_delta):
-                    if best_flip is None or child.norm < best_flip.norm:
-                        best_flip = child
+                if _better_flip_node(child, best_flip, min_delta=min_delta, max_delta=max_delta):
+                    best_flip = child
 
         if not children:
             fallback_state = clone_attack_state(
@@ -2532,12 +2549,13 @@ def run_beam_search_phase(
                         )
                         children.append(child)
                         if last_verify is not None and last_verify.flip_candidate:
-                            if best_flip is None or last_verify.norm < best_flip.norm:
-                                best_flip = build_beam_node(
-                                    fallback_state,
-                                    recent_gain_per_pixel=last_verify.gain_per_pixel,
-                                    round_id=round_idx,
-                                )
+                            candidate_flip = build_beam_node(
+                                fallback_state,
+                                recent_gain_per_pixel=last_verify.gain_per_pixel,
+                                round_id=round_idx,
+                            )
+                            if _better_flip_node(candidate_flip, best_flip, min_delta=min_delta, max_delta=max_delta):
+                                best_flip = candidate_flip
             if not children:
                 break
 
@@ -2690,14 +2708,23 @@ def reverse_pixel_changes(
 
 def _removal_breaks_min_delta(
     delta: torch.Tensor,
-    changed_mask: torch.Tensor,
     pixel_changes: list[PixelChange],
     *,
     min_delta: float,
 ) -> bool:
-    """Reject removals that drop Linf below validator min_delta floor."""
+    """
+    Reject removals that drop Linf below validator min_delta floor.
+
+    IMPORTANT:
+    Existing prune call sites pass only:
+        _removal_breaks_min_delta(state.delta, pixels, min_delta=min_delta)
+
+    So this function must rebuild changed_mask internally.
+    """
     if not pixel_changes:
         return False
+
+    changed_mask = delta.abs() > 1e-12
     trial_delta, _ = reverse_pixel_changes(delta, changed_mask, pixel_changes)
     new_linf = float(trial_delta.abs().max().item())
     return new_linf < float(min_delta) - 1e-9
@@ -3208,31 +3235,44 @@ def _roundtrip_restore_candidates(
     accepted_groups: list[AcceptedGroup] | None,
     restore_adv_candidates: list[torch.Tensor] | None,
 ) -> list[torch.Tensor]:
+    """
+    Candidate order should prefer the final/pruned adv first.
+
+    Previous order tried restore backups before final adv, which can return
+    a higher-RMSE pre-prune result even when final adv passes.
+    """
     candidates: list[torch.Tensor] = []
-    seen: set[tuple[int, ...]] = set()
+    seen: set[bytes] = set()
+
+    def _key(tensor: torch.Tensor) -> bytes:
+        q = (tensor.detach().cpu().clamp(0, 1) * 255.0).round().to(torch.uint8)
+        return q.numpy().tobytes()
 
     def _add(tensor: torch.Tensor) -> None:
-        key = tuple(int(v) for v in (tensor.detach().cpu().clamp(0, 1) * 255.0).round().byte().reshape(-1)[:64].tolist())
+        key = _key(tensor)
         if key in seen:
             return
         seen.add(key)
         candidates.append(tensor.detach().clamp(0.0, 1.0))
 
+    # 1. Final pruned candidate first.
+    _add(adv)
+
+    # 2. Try individual high-quality groups. Sometimes one group alone flips with lower RMSE.
+    if accepted_groups:
+        for group in sorted(
+            accepted_groups,
+            key=lambda batch: (len(batch.pixels), -batch.gain_per_pixel, -batch.gain),
+        ):
+            _add(_adv_from_accepted_group(clean, group))
+
+    # 3. Backups last only.
     if restore_adv_candidates:
         for item in restore_adv_candidates:
             _add(item)
 
-    if accepted_groups:
-        for group in sorted(
-            accepted_groups,
-            key=lambda batch: (batch.gain_per_pixel, batch.gain),
-            reverse=True,
-        ):
-            _add(_adv_from_accepted_group(clean, group))
-
-    _add(adv)
     return candidates
-
+    
 
 def _roundtrip_decoded_passes(
     model: torch.nn.Module,
@@ -3275,12 +3315,8 @@ def png_roundtrip_verify(
     """
     PNG encode/decode roundtrip using perturbnet.image_io helpers.
 
-    In strict one-step mode:
-        - first quantize candidate to {-1/255, 0, +1/255}
-        - encode PNG
-        - decode PNG
-        - validate decoded tensor
-        - return decoded tensor, because that is what validator sees
+    Instead of returning the first passing candidate, test all candidate sources
+    and return the lowest-RMSE validator-passing decoded tensor.
     """
     strict_max_delta = min(float(max_delta), float(MAX_STRICT_LINF)) if STRICT_ONE_STEP_LINF else float(max_delta)
 
@@ -3290,6 +3326,8 @@ def png_roundtrip_verify(
         accepted_groups=accepted_groups,
         restore_adv_candidates=restore_adv_candidates,
     )
+
+    best_result: PngRoundtripResult | None = None
 
     last_encoded = ""
     last_decoded: torch.Tensor | None = None
@@ -3337,7 +3375,7 @@ def png_roundtrip_verify(
             last_reason = "below_min_psnr"
             continue
 
-        return PngRoundtripResult(
+        candidate_result = PngRoundtripResult(
             final_adv=decoded.detach().clamp(0.0, 1.0),
             encoded_b64=encoded,
             decoded_adv=decoded.detach().clamp(0.0, 1.0),
@@ -3349,7 +3387,12 @@ def png_roundtrip_verify(
             reason="roundtrip_ok" if index == 0 else "restored_backup",
         )
 
-    # Return decoded last candidate, not the pre-encoded float tensor.
+        if best_result is None or candidate_result.rmse < best_result.rmse - 1e-12:
+            best_result = candidate_result
+
+    if best_result is not None:
+        return best_result
+
     if last_decoded is None:
         fallback = enforce_one_step_delta(clean, adv) if STRICT_ONE_STEP_LINF else adv.detach().clamp(0.0, 1.0)
         last_encoded = encode_image_b64(fallback)
@@ -3369,7 +3412,7 @@ def png_roundtrip_verify(
         restored_from_backup=False,
         reason=last_reason,
     )
-    
+
 
 def final_validate_roundtrip(
     model: torch.nn.Module,
@@ -3396,6 +3439,91 @@ def final_validate_roundtrip(
     return result.final_adv
 
 
+def roundtrip_pixel_prune(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    adv: torch.Tensor,
+    true_idx: int,
+    *,
+    min_delta: float,
+    max_delta: float,
+    deadline: float | None = None,
+    max_checks: int = 512,
+) -> torch.Tensor:
+    """
+    Final decoded-space pruning.
+
+    Removes changed pixel-channels after PNG decode, then re-encodes/re-decodes
+    and keeps the removal only if validator checks still pass.
+    """
+    best = adv.detach().clone().clamp(0.0, 1.0)
+
+    if not validator_passes_adv(
+        model=model,
+        clean=clean,
+        adv=best,
+        true_idx=true_idx,
+        min_delta=min_delta,
+        max_delta=max_delta,
+    ):
+        return best
+
+    changed = (best - clean).abs() > 1e-12
+    coords = changed.nonzero(as_tuple=False)
+
+    if coords.numel() == 0:
+        return best
+
+    # Try larger chunks first, then single pixels.
+    checks = 0
+    for chunk_size in (16, 8, 4, 1):
+        improved = True
+        while improved:
+            improved = False
+            coords = ((best - clean).abs() > 1e-12).nonzero(as_tuple=False)
+
+            if coords.shape[0] < chunk_size:
+                break
+
+            # Newest info is unavailable after decode, so scan from the end.
+            for start in range(max(0, coords.shape[0] - chunk_size), -1, -chunk_size):
+                if deadline is not None and time.monotonic() >= deadline:
+                    return best
+                if checks >= max_checks:
+                    return best
+
+                chunk = coords[start : start + chunk_size]
+                trial = best.clone()
+
+                for c, y, x in chunk.tolist():
+                    trial[int(c), int(y), int(x)] = clean[int(c), int(y), int(x)]
+
+                if STRICT_ONE_STEP_LINF:
+                    trial = enforce_one_step_delta(clean, trial)
+
+                encoded = encode_image_b64(trial)
+                decoded = decode_image_b64(encoded).to(device=clean.device)
+
+                checks += 1
+
+                if not validator_passes_adv(
+                    model=model,
+                    clean=clean,
+                    adv=decoded,
+                    true_idx=true_idx,
+                    min_delta=min_delta,
+                    max_delta=max_delta,
+                ):
+                    continue
+
+                if candidate_stats(clean, decoded).rmse < candidate_stats(clean, best).rmse - 1e-12:
+                    best = decoded.detach().clamp(0.0, 1.0)
+                    improved = True
+                    break
+
+    return best
+
+
 def select_best_beam_node(
     beam: list[BeamNode],
     *,
@@ -3403,16 +3531,20 @@ def select_best_beam_node(
     max_delta: float,
     best_flip: BeamNode | None = None,
 ) -> BeamNode | None:
+    candidates = list(beam)
+
     if best_flip is not None and _is_valid_flip_node(
         best_flip,
         min_delta=min_delta,
         max_delta=max_delta,
     ):
-        return best_flip
-    if not beam:
+        candidates.append(best_flip)
+
+    if not candidates:
         return None
+
     return min(
-        beam,
+        candidates,
         key=lambda node: beam_rank_key(node, min_delta=min_delta, max_delta=max_delta),
     )
 
@@ -3922,6 +4054,34 @@ def finalize_miner_adversarial(
         accepted_groups=attack_output.accepted_groups,
         restore_adv_candidates=[attack_output.pre_prune_adv],
     )
+
+    if roundtrip.passed:
+        prune_deadline = deadline if deadline is not None else None
+        pruned_decoded = roundtrip_pixel_prune(
+            model=model,
+            clean=clean,
+            adv=roundtrip.final_adv,
+            true_idx=true_idx,
+            min_delta=min_delta,
+            max_delta=max_delta,
+            deadline=prune_deadline,
+            max_checks=int(os.getenv("PERTURB_FINAL_PRUNE_MAX_CHECKS", "512")),
+        )
+
+        pruned_roundtrip = png_roundtrip_verify(
+            model=model,
+            clean=clean,
+            adv=pruned_decoded,
+            true_idx=true_idx,
+            min_delta=min_delta,
+            max_delta=max_delta,
+            accepted_groups=None,
+            restore_adv_candidates=[roundtrip.final_adv],
+        )
+
+        if pruned_roundtrip.passed and pruned_roundtrip.rmse <= roundtrip.rmse + 1e-12:
+            roundtrip = pruned_roundtrip
+
     final_stats = check_flip_and_gap(
         model=model,
         clean=clean,

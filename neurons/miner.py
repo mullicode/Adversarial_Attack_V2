@@ -215,28 +215,36 @@ class PerturbMiner:
         task_id = str(getattr(synapse, "task_id", "unknown"))
         true_label = str(getattr(synapse, "true_label", "") or "")
 
-        attack_output = run_feature_guided_attack(
-            model=self.model,
-            clean=clean,
-            true_idx=true_idx,
-            epsilon=effective_max,
-            min_delta=min_delta,
-            timeout_seconds=timeout_seconds,
-            hyperparams=attack_hyperparams,
-            task_id=task_id,
-            true_label=true_label,
-        )
+        try:
+            attack_output = run_feature_guided_attack(
+                model=self.model,
+                clean=clean,
+                true_idx=true_idx,
+                epsilon=effective_max,
+                min_delta=min_delta,
+                timeout_seconds=timeout_seconds,
+                hyperparams=attack_hyperparams,
+                task_id=task_id,
+                true_label=true_label,
+            )
 
-        final_adv, roundtrip, final_stats = finalize_miner_adversarial(
-            model=self.model,
-            clean=clean,
-            attack_output=attack_output,
-            true_idx=true_idx,
-            min_delta=min_delta,
-            max_delta=effective_max,
-            deadline=deadline,
-            log_session=attack_output.log_session,
-        )
+            final_adv, roundtrip, final_stats = finalize_miner_adversarial(
+                model=self.model,
+                clean=clean,
+                attack_output=attack_output,
+                true_idx=true_idx,
+                min_delta=min_delta,
+                max_delta=effective_max,
+                deadline=deadline,
+                log_session=attack_output.log_session,
+            )
+
+        except Exception:
+            logger.exception("[MINER_ERROR] task=%s attack failed; returning clean image to avoid response_missing", task_id)
+            final_adv = clean
+            encoded = encode_image_b64(final_adv)
+            synapse.perturbed_image_b64 = encoded
+            return synapse
 
         excel_path = None
         if attack_output.log_session is not None:
